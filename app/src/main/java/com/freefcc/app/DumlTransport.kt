@@ -156,14 +156,15 @@ class DumlBuilder {
          *
          * Checks magic, encoded length (must exactly match the byte count received —
          * catches truncated/appended reads), header CRC-8, full-frame CRC-16, the
-         * response bit in cmdType, matching sequence number, reversed sender/receiver
-         * routing, and matching command set/ID. Pure function, no I/O — every check
+         * matching sequence number, reversed sender/receiver routing, and matching
+         * command set/ID. The response bit is deliberately not required because DJI
+         * devices commonly omit it on otherwise valid replies. Pure function, no I/O — every check
          * runs against the two byte arrays given.
          *
          * Wire layout used here:
          *   [4] sender, [5] dst, [6-7] seq, [8] cmdType, [9] cmdSet, [10] cmdId
-         * A response echoes [4]<->[5] (sender<->receiver reversed) and sets
-         * bit 7 of [8] (cmdType response flag).
+         * A response echoes [4]<->[5] (sender<->receiver reversed). Bit 7 of
+         * [8] is advisory only and is not reliable across DJI components.
          *
          * @return the response payload on success, or null on any mismatch
          */
@@ -183,9 +184,6 @@ class DumlBuilder {
             if (expectedCrc16 != actualCrc16) return null
 
             if (request.size < 11) return null
-
-            val cmdType = response[8].toInt() and 0xFF
-            if ((cmdType and 0x80) == 0) return null // response bit not set
 
             if (response[6] != request[6] || response[7] != request[7]) return null // sequence
             if (response[4] != request[5] || response[5] != request[4]) return null // reversed routing
