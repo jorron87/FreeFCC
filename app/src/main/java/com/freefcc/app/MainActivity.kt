@@ -93,7 +93,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun AppRoot(viewModel: FccViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    val pagerState = rememberPagerState(initialPage = 0) { 5 }
+    val pagerState = rememberPagerState(initialPage = 0) { 6 }
     val scope = rememberCoroutineScope()
 
     val entrance = remember { Animatable(0f) }
@@ -137,9 +137,10 @@ private fun AppRoot(viewModel: FccViewModel) {
             when (page) {
                 0 -> FccPage(state, viewModel)
                 1 -> InfoPage(state, viewModel)
-                2 -> LogPage(state)
-                3 -> UpdatePage(state, viewModel)
-                4 -> SupportPage()
+                2 -> TelemetryPage(state, viewModel)
+                3 -> LogPage(state)
+                4 -> UpdatePage(state, viewModel)
+                5 -> SupportPage()
             }
         }
 
@@ -151,6 +152,174 @@ private fun AppRoot(viewModel: FccViewModel) {
             },
             modifier = Modifier.align(Alignment.BottomCenter)
         )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Page 3: Telemetry research
+// ═══════════════════════════════════════════════════════════════════════
+
+@Composable
+private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
+    val runtime = state.telemetryRuntime
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp)
+            .padding(bottom = BottomNavHeight + 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Spacer(Modifier.height(56.dp))
+        PageTitle("Telemetry", Icons.Filled.Code)
+        Spacer(Modifier.height(28.dp))
+
+        GlowCard {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                StatusDot(
+                    when {
+                        runtime.running && runtime.relayConnected -> Green
+                        runtime.running || runtime.connecting -> Amber
+                        runtime.lastError.isNotEmpty() -> Red
+                        else -> TextDim
+                    }
+                )
+                Spacer(Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        when {
+                            runtime.running && runtime.relayConnected -> "Streaming to Mac"
+                            runtime.running || runtime.connecting -> "Starting relay"
+                            runtime.lastError.isNotEmpty() -> "Stopped fail-closed"
+                            else -> "Stopped"
+                        },
+                        color = TextWhite,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        runtime.sourceMode.ifBlank { "bench_active_socket" },
+                        color = Amber,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+            BodyText(
+                "Bench-only source: opens 127.0.0.1:40009 and sends no bytes. Stop if DJI Fly reconnects or control link changes.",
+                Amber
+            )
+
+            if (runtime.sessionId.isNotEmpty()) {
+                Spacer(Modifier.height(16.dp))
+                InfoRow("Session", runtime.sessionId.take(8), Cyan)
+            }
+            if (runtime.lastError.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                BodyText(runtime.lastError, Red)
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        GlowCard {
+            Text("Mac relay", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(14.dp))
+            ResearchTextField(
+                value = state.telemetryHost,
+                onValueChange = viewModel::updateTelemetryHost,
+                label = "Mac IP",
+                placeholder = "192.168.1.20",
+                enabled = !runtime.running
+            )
+            Spacer(Modifier.height(10.dp))
+            ResearchTextField(
+                value = state.telemetryPort,
+                onValueChange = viewModel::updateTelemetryPort,
+                label = "Port",
+                placeholder = "8765",
+                enabled = !runtime.running
+            )
+            Spacer(Modifier.height(10.dp))
+            ResearchTextField(
+                value = state.telemetrySourceId,
+                onValueChange = viewModel::updateTelemetrySourceId,
+                label = "Source ID",
+                placeholder = "rc2-bench",
+                enabled = !runtime.running
+            )
+            Spacer(Modifier.height(18.dp))
+            if (runtime.running) {
+                GlowButton("Stop Relay", Red) { viewModel.stopTelemetryRelay() }
+            } else {
+                GlowButton("Start Relay", Cyan, enabled = !state.isHardwareBusy) { viewModel.startTelemetryRelay() }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        GlowCard {
+            Text("Session metadata", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(14.dp))
+            ResearchTextField(
+                value = state.telemetryControllerFirmware,
+                onValueChange = viewModel::updateTelemetryControllerFirmware,
+                label = "RC firmware",
+                placeholder = "record before test",
+                enabled = !runtime.running
+            )
+            Spacer(Modifier.height(10.dp))
+            ResearchTextField(
+                value = state.telemetryDjiFlyVersion,
+                onValueChange = viewModel::updateTelemetryDjiFlyVersion,
+                label = "DJI Fly",
+                placeholder = "v1.xx.x",
+                enabled = !runtime.running
+            )
+            Spacer(Modifier.height(10.dp))
+            ResearchTextField(
+                value = state.telemetryAircraftModel,
+                onValueChange = viewModel::updateTelemetryAircraftModel,
+                label = "Aircraft",
+                placeholder = "Air 3S / Mini / ...",
+                enabled = !runtime.running
+            )
+            Spacer(Modifier.height(10.dp))
+            ResearchTextField(
+                value = state.telemetryAircraftFirmware,
+                onValueChange = viewModel::updateTelemetryAircraftFirmware,
+                label = "Aircraft firmware",
+                placeholder = "record before test",
+                enabled = !runtime.running
+            )
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        GlowCard {
+            Text("Counters", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(12.dp))
+            InfoRow("Raw chunks", runtime.rawChunks.toString(), Cyan)
+            Spacer(Modifier.height(10.dp))
+            DividerLine()
+            Spacer(Modifier.height(10.dp))
+            InfoRow("DUML frames", runtime.frames.toString(), Green)
+            Spacer(Modifier.height(10.dp))
+            DividerLine()
+            Spacer(Modifier.height(10.dp))
+            InfoRow("Parser errors", runtime.parserErrors.toString(), if (runtime.parserErrors == 0L) TextGray else Amber)
+            Spacer(Modifier.height(10.dp))
+            DividerLine()
+            Spacer(Modifier.height(10.dp))
+            InfoRow("Bytes", runtime.bytes.toString(), TextWhite)
+            Spacer(Modifier.height(10.dp))
+            DividerLine()
+            Spacer(Modifier.height(10.dp))
+            InfoRow("Queue", runtime.queueDepth.toString(), if (runtime.queueDepth < 400) TextGray else Amber)
+        }
     }
 }
 
@@ -586,8 +755,55 @@ private fun UpdatePage(state: AppState, viewModel: FccViewModel) {
         Spacer(Modifier.height(56.dp))
         PageTitle("Updates", Icons.Outlined.SystemUpdate)
 
+        Spacer(Modifier.height(20.dp))
+        GlowCard {
+            Text("Release channel", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(12.dp))
+            ResearchTextField(
+                value = state.updateEndpoint,
+                onValueChange = viewModel::updateReleaseEndpoint,
+                label = "Manifest or GitHub API URL",
+                placeholder = UpdateChecker.DEFAULT_API_URL,
+                enabled = !state.isCheckingUpdate && !state.isDownloadingUpdate
+            )
+            Spacer(Modifier.height(14.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Button(
+                    onClick = { viewModel.resetReleaseEndpoint() },
+                    enabled = !state.isCheckingUpdate && !state.isDownloadingUpdate,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.Transparent,
+                        contentColor = TextGray,
+                        disabledContainerColor = TextGray.copy(0.1f),
+                        disabledContentColor = TextGray.copy(0.3f)
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, CardBorder),
+                    modifier = Modifier.weight(1f).height(46.dp)
+                ) {
+                    Text("Reset", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                }
+                Button(
+                    onClick = { viewModel.checkForUpdates(force = true) },
+                    enabled = !state.isCheckingUpdate && !state.isDownloadingUpdate,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Cyan,
+                        contentColor = BgDark,
+                        disabledContainerColor = Cyan.copy(0.2f),
+                        disabledContentColor = Cyan.copy(0.4f)
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.weight(1f).height(46.dp)
+                ) {
+                    Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Check", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                }
+            }
+        }
+
         if (state.isCheckingUpdate) {
-            Spacer(Modifier.height(28.dp))
+            Spacer(Modifier.height(16.dp))
             GlowCard {
                 Column(
                     Modifier.fillMaxWidth(),
@@ -603,7 +819,7 @@ private fun UpdatePage(state: AppState, viewModel: FccViewModel) {
 
         val info = state.updateInfo
         if (info == null && state.updateChecked) {
-            Spacer(Modifier.height(28.dp))
+            Spacer(Modifier.height(16.dp))
             GlowCard {
                 Column(
                     Modifier.fillMaxWidth(),
@@ -626,7 +842,7 @@ private fun UpdatePage(state: AppState, viewModel: FccViewModel) {
 
         if (info == null) return@Column
 
-        Spacer(Modifier.height(28.dp))
+        Spacer(Modifier.height(16.dp))
 
         GlowCard {
             Row(
@@ -665,6 +881,17 @@ private fun UpdatePage(state: AppState, viewModel: FccViewModel) {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text("Latest:", color = TextGray, fontSize = 13.sp)
                     Text("v${info.version}", color = Green, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+                Spacer(Modifier.height(10.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("Source:", color = TextGray, fontSize = 13.sp)
+                    Text(
+                        info.source.take(32),
+                        color = TextWhite,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        maxLines = 1
+                    )
                 }
                 Spacer(Modifier.height(10.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -1107,6 +1334,36 @@ private fun BodyText(text: String, color: Color = TextGray) {
 }
 
 @Composable
+private fun ResearchTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    placeholder: String,
+    enabled: Boolean
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        enabled = enabled,
+        label = { Text(label) },
+        placeholder = { Text(placeholder) },
+        singleLine = true,
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = Cyan,
+            unfocusedBorderColor = CardBorder,
+            focusedLabelColor = Cyan,
+            unfocusedLabelColor = TextGray,
+            focusedTextColor = TextWhite,
+            unfocusedTextColor = TextWhite,
+            disabledTextColor = TextGray,
+            disabledBorderColor = CardBorder.copy(0.5f),
+            cursorColor = Cyan
+        ),
+        modifier = Modifier.fillMaxWidth()
+    )
+}
+
+@Composable
 private fun SerialRow(serial: String, enabled: Boolean = true, onRefresh: () -> Unit) {
     Surface(
         color = BgLight.copy(0.4f),
@@ -1259,6 +1516,7 @@ private fun BottomNavBar(
     val tabs = listOf(
         Triple("FCC", Icons.Filled.Wifi, Cyan),
         Triple("Info", Icons.Filled.Info, Green),
+        Triple("Relay", Icons.Filled.Code, Cyan),
         Triple("Log", Icons.Filled.History, Amber),
         Triple("Update", Icons.Filled.SystemUpdate, Color(0xFFB39DDB)),
         Triple("Support", Icons.Filled.Favorite, Red)

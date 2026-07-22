@@ -48,8 +48,18 @@ data class AppState(
     val isUpdateDownloaded: Boolean = false,
     val updateAvailable: Boolean = false,
     val updateChecked: Boolean = false,
+    val updateEndpoint: String = UpdateChecker.DEFAULT_API_URL,
     // Keepalive state
-    val isKeepaliveRunning: Boolean = false
+    val isKeepaliveRunning: Boolean = false,
+    // Telemetry research state
+    val telemetryHost: String = "",
+    val telemetryPort: String = "8765",
+    val telemetrySourceId: String = "rc2-bench",
+    val telemetryControllerFirmware: String = "",
+    val telemetryDjiFlyVersion: String = "",
+    val telemetryAircraftModel: String = "",
+    val telemetryAircraftFirmware: String = "",
+    val telemetryRuntime: TelemetryRuntimeState = TelemetryRuntimeState()
 )
 
 /**
@@ -65,7 +75,7 @@ data class AppState(
 class FccViewModel(private val app: Application) : AndroidViewModel(app) {
 
     companion object {
-        const val APP_VERSION = "1.5.2"
+        const val APP_VERSION = "1.5.3-research.2"
 
         /**
          * Aircraft model codes known to support DJI Cellular Dongle 2 / 4G.
@@ -95,11 +105,34 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             HardwareLock.busy.collect { busy -> update { copy(isHardwareBusy = busy) } }
         }
+        viewModelScope.launch {
+            TelemetryStatusBus.updates.collect { runtime -> update { copy(telemetryRuntime = runtime) } }
+        }
         // Restore the cached aircraft serial from a previous session so the
         // user does not have to re-probe before 4G if the drone is the same.
         val cachedSerial = prefs.getString("aircraft_serial", "").orEmpty()
         if (cachedSerial.isNotEmpty()) {
             update { copy(aircraftSerial = cachedSerial) }
+        }
+        val storedUpdateEndpoint = prefs.getString("update_endpoint", "").orEmpty()
+        val updateEndpoint = when (storedUpdateEndpoint) {
+            "", UpdateChecker.LEGACY_API_URL -> UpdateChecker.DEFAULT_API_URL
+            else -> storedUpdateEndpoint
+        }
+        if (storedUpdateEndpoint == UpdateChecker.LEGACY_API_URL) {
+            prefs.edit().putString("update_endpoint", updateEndpoint).apply()
+        }
+        update {
+            copy(
+                telemetryHost = prefs.getString("telemetry_host", "").orEmpty(),
+                telemetryPort = prefs.getString("telemetry_port", "8765").orEmpty().ifBlank { "8765" },
+                telemetrySourceId = prefs.getString("telemetry_source_id", "rc2-bench").orEmpty().ifBlank { "rc2-bench" },
+                telemetryControllerFirmware = prefs.getString("telemetry_controller_firmware", "").orEmpty(),
+                telemetryDjiFlyVersion = prefs.getString("telemetry_dji_fly_version", "").orEmpty(),
+                telemetryAircraftModel = prefs.getString("telemetry_aircraft_model", "").orEmpty(),
+                telemetryAircraftFirmware = prefs.getString("telemetry_aircraft_firmware", "").orEmpty(),
+                updateEndpoint = updateEndpoint
+            )
         }
     }
 
@@ -123,6 +156,84 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
         }
 
         checkForUpdates()
+    }
+
+    // --- Telemetry research ---
+
+    fun updateTelemetryHost(value: String) {
+        prefs.edit().putString("telemetry_host", value.trim()).apply()
+        update { copy(telemetryHost = value.trim()) }
+    }
+
+    fun updateTelemetryPort(value: String) {
+        val cleaned = value.filter { it.isDigit() }.take(5)
+        prefs.edit().putString("telemetry_port", cleaned).apply()
+        update { copy(telemetryPort = cleaned) }
+    }
+
+    fun updateTelemetrySourceId(value: String) {
+        val cleaned = value.trim().ifBlank { "rc2-bench" }
+        prefs.edit().putString("telemetry_source_id", cleaned).apply()
+        update { copy(telemetrySourceId = cleaned) }
+    }
+
+    fun updateTelemetryControllerFirmware(value: String) {
+        prefs.edit().putString("telemetry_controller_firmware", value.trim()).apply()
+        update { copy(telemetryControllerFirmware = value.trim()) }
+    }
+
+    fun updateTelemetryDjiFlyVersion(value: String) {
+        prefs.edit().putString("telemetry_dji_fly_version", value.trim()).apply()
+        update { copy(telemetryDjiFlyVersion = value.trim()) }
+    }
+
+    fun updateTelemetryAircraftModel(value: String) {
+        prefs.edit().putString("telemetry_aircraft_model", value.trim()).apply()
+        update { copy(telemetryAircraftModel = value.trim()) }
+    }
+
+    fun updateTelemetryAircraftFirmware(value: String) {
+        prefs.edit().putString("telemetry_aircraft_firmware", value.trim()).apply()
+        update { copy(telemetryAircraftFirmware = value.trim()) }
+    }
+
+    fun startTelemetryRelay() {
+        val current = _state.value
+        val port = current.telemetryPort.toIntOrNull()
+        if (current.telemetryHost.isBlank() || port == null || port !in 1..65535) {
+            update { copy(message = "Enter a valid Mac IP and port before telemetry relay starts.") }
+            log("Telemetry relay not started — invalid Mac host or port")
+            return
+        }
+
+        if (current.autoFcc) {
+            prefs.edit().putBoolean("auto_fcc", false).apply()
+            update { copy(autoFcc = false) }
+            log("Auto-FCC disabled for telemetry research mode")
+        }
+        if (current.isKeepaliveRunning) {
+            FccKeepaliveService.stop(app)
+            update { copy(isKeepaliveRunning = false) }
+            log("FCC keepalive stopped before telemetry relay")
+        }
+
+        val config = TelemetryConfig(
+            host = current.telemetryHost,
+            port = port,
+            sourceId = current.telemetrySourceId.ifBlank { "rc2-bench" },
+            controllerFirmware = current.telemetryControllerFirmware,
+            djiFlyVersion = current.telemetryDjiFlyVersion,
+            aircraftModel = current.telemetryAircraftModel,
+            aircraftFirmware = current.telemetryAircraftFirmware
+        )
+        TelemetryCaptureService.start(app, config)
+        log("Telemetry relay starting: ${config.sourceMode.wireName} -> ${config.host}:${config.port}")
+    }
+
+    fun stopTelemetryRelay() {
+        TelemetryCaptureService.stop(app)
+        TelemetryStatusBus.reset()
+        log("Telemetry relay stopped")
     }
 
     // --- Auto-FCC ---
@@ -720,7 +831,8 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
         log("Checking for updates...")
 
         runOnIO {
-            val info = UpdateChecker.fetchLatest()
+            val endpoint = _state.value.updateEndpoint.ifBlank { UpdateChecker.DEFAULT_API_URL }
+            val info = UpdateChecker.fetchLatest(endpoint)
             if (info == null) {
                 // Don't save lastCheck on failure — let the user retry immediately.
                 update { copy(isCheckingUpdate = false, updateChecked = true) }
@@ -746,6 +858,18 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
                 log("App is up to date (v$APP_VERSION)")
             }
         }
+    }
+
+    fun updateReleaseEndpoint(value: String) {
+        val cleaned = value.trim()
+        prefs.edit().putString("update_endpoint", cleaned).apply()
+        update { copy(updateEndpoint = cleaned, updateChecked = false, updateInfo = null, updateAvailable = false) }
+    }
+
+    fun resetReleaseEndpoint() {
+        prefs.edit().putString("update_endpoint", UpdateChecker.DEFAULT_API_URL).apply()
+        update { copy(updateEndpoint = UpdateChecker.DEFAULT_API_URL, updateChecked = false, updateInfo = null, updateAvailable = false) }
+        log("Release channel reset to the FreeFCC research channel")
     }
 
     private var downloadedApk: java.io.File? = null

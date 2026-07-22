@@ -10,10 +10,11 @@ import java.net.URL
 import java.security.MessageDigest
 
 /**
- * Checks for app updates by querying the GitHub Releases API.
+ * Checks for app updates by querying either the GitHub Releases API or a small
+ * release manifest for fork/research builds.
  *
- * GitHub API endpoint:
- *   GET https://api.github.com/repos/doesthings/FreeFCC/releases/latest
+ * Default research release endpoint:
+ *   GET https://api.github.com/repos/jorron87/FreeFCC/releases/latest
  *
  * Returns JSON with tag_name, name, body (changelog), and assets[] (download URLs).
  *
@@ -29,7 +30,8 @@ data class UpdateInfo(
     val downloadUrl: String,  // direct APK URL
     val apkSize: Long,        // bytes
     val publishedAt: String,  // ISO date
-    val sha256: String?       // expected hex digest from GitHub, or null if absent
+    val sha256: String?,      // expected hex digest from release metadata, or null if absent
+    val source: String        // release channel URL or repository
 ) {
     fun isNewerThan(currentVersion: String): Boolean {
         val cur = parseVersion(currentVersion)
@@ -44,23 +46,27 @@ data class UpdateInfo(
     }
 
     private fun parseVersion(v: String): List<Int> {
-        return v.removePrefix("v").split(".").mapNotNull { it.toIntOrNull() }
+        return v.removePrefix("v")
+            .split(".", "-", "_")
+            .mapNotNull { part -> Regex("""\d+""").find(part)?.value?.toIntOrNull() }
     }
 }
 
 object UpdateChecker {
 
-    private const val REPO = "doesthings/FreeFCC"
-    private const val API_URL = "https://api.github.com/repos/$REPO/releases/latest"
+    const val DEFAULT_REPO = "jorron87/FreeFCC"
+    const val DEFAULT_API_URL = "https://api.github.com/repos/$DEFAULT_REPO/releases/latest"
+    const val LEGACY_API_URL = "https://api.github.com/repos/doesthings/FreeFCC/releases/latest"
 
     /**
      * Fetches the latest release info from GitHub.
      * Returns null on any error (network, parse, etc).
      */
-    fun fetchLatest(): UpdateInfo? {
+    fun fetchLatest(endpoint: String = DEFAULT_API_URL): UpdateInfo? {
+        val trimmedEndpoint = endpoint.trim().ifBlank { DEFAULT_API_URL }
         var conn: HttpURLConnection? = null
         return try {
-            conn = (URL(API_URL).openConnection() as HttpURLConnection).apply {
+            conn = (URL(trimmedEndpoint).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 connectTimeout = 8000
                 readTimeout = 8000
@@ -71,47 +77,74 @@ object UpdateChecker {
             if (conn.responseCode != 200) return null
 
             val body = conn.inputStream.bufferedReader().use { it.readText() }
-            val json = JSONObject(body)
-
-            val tagName = json.optString("tag_name", "").removePrefix("v")
-            val name = json.optString("name", "v$tagName")
-            val changelog = json.optString("body", "").trim()
-            val publishedAt = json.optString("published_at", "")
-
-            // Find the first APK asset
-            val assets = json.optJSONArray("assets") ?: return null
-            var apkUrl: String? = null
-            var apkSize = 0L
-            var sha256: String? = null
-            for (i in 0 until assets.length()) {
-                val asset = assets.getJSONObject(i)
-                val nameField = asset.optString("name", "")
-                if (nameField.endsWith(".apk", ignoreCase = true)) {
-                    apkUrl = asset.optString("browser_download_url", "")
-                    apkSize = asset.optLong("size", 0)
-                    // GitHub returns "sha256:<hex>" in the digest field.
-                    sha256 = asset.optString("digest", "").removePrefix("sha256:").ifEmpty { null }
-                    break
-                }
-            }
-
-            if (apkUrl == null) return null
-
-            UpdateInfo(
-                version = tagName,
-                title = name,
-                changelog = changelog,
-                downloadUrl = apkUrl,
-                apkSize = apkSize,
-                publishedAt = publishedAt,
-                sha256 = sha256
-            )
+            parseReleaseJson(body, trimmedEndpoint)
         } catch (e: Exception) {
             Log.w("FreeFCC-Update", "fetchLatest failed: ${e.javaClass.simpleName}: ${e.message}")
             null
         } finally {
             conn?.disconnect()
         }
+    }
+
+    fun parseReleaseJson(body: String, source: String): UpdateInfo? {
+        val json = JSONObject(body)
+        return if (json.has("assets")) {
+            parseGithubRelease(json, source)
+        } else {
+            parseManifest(json, source)
+        }
+    }
+
+    private fun parseGithubRelease(json: JSONObject, source: String): UpdateInfo? {
+        val tagName = json.optString("tag_name", "").removePrefix("v")
+        val name = json.optString("name", "v$tagName")
+        val changelog = json.optString("body", "").trim()
+        val publishedAt = json.optString("published_at", "")
+
+        val assets = json.optJSONArray("assets") ?: return null
+        var apkUrl: String? = null
+        var apkSize = 0L
+        var sha256: String? = null
+        for (i in 0 until assets.length()) {
+            val asset = assets.getJSONObject(i)
+            val nameField = asset.optString("name", "")
+            if (nameField.endsWith(".apk", ignoreCase = true)) {
+                apkUrl = asset.optString("browser_download_url", "")
+                apkSize = asset.optLong("size", 0)
+                sha256 = asset.optString("digest", "").removePrefix("sha256:").ifEmpty { null }
+                break
+            }
+        }
+
+        if (apkUrl == null) return null
+
+        return UpdateInfo(
+            version = tagName,
+            title = name,
+            changelog = changelog,
+            downloadUrl = apkUrl,
+            apkSize = apkSize,
+            publishedAt = publishedAt,
+            sha256 = sha256,
+            source = source
+        )
+    }
+
+    private fun parseManifest(json: JSONObject, source: String): UpdateInfo? {
+        val version = json.optString("version", json.optString("tag_name", "")).removePrefix("v")
+        val apkUrl = json.optString("apk_url", json.optString("download_url", ""))
+        if (version.isBlank() || apkUrl.isBlank()) return null
+
+        return UpdateInfo(
+            version = version,
+            title = json.optString("title", "v$version"),
+            changelog = json.optString("changelog", json.optString("body", "")).trim(),
+            downloadUrl = apkUrl,
+            apkSize = json.optLong("apk_size", json.optLong("size", 0L)),
+            publishedAt = json.optString("published_at", json.optString("date", "")),
+            sha256 = json.optString("sha256", "").removePrefix("sha256:").ifEmpty { null },
+            source = source
+        )
     }
 
     /**

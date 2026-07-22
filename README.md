@@ -34,6 +34,7 @@ A free and open-source Android app that unlocks FCC mode, sends 4G activation fr
 | **4G Activation** | Sends 4G activation frames to the aircraft (serial read at runtime) — no status readback, experimental |
 | **LED Control** | Turn aircraft arm LEDs on or off (requires DJI Fly running with aircraft connected) |
 | **Device Info** | Queries the controller for hardware and firmware version |
+| **Telemetry Research** | Bench-only raw DUML relay to a local Mac for georeferencing research |
 | **Auto-FCC** | Toggle to automatically connect and apply FCC every time the app opens |
 | **Auto-Updater** | Checks GitHub for new releases and lets you download/install from the app |
 | **Offline** | Everything runs locally. No internet, no server, no tracking (except update check) |
@@ -174,6 +175,45 @@ Every contribution helps cover server costs and keeps development going. Thank y
 The app sends DUML commands to the controller's local TCP proxy at `127.0.0.1:40009`. DUML is DJI's internal command protocol, publicly documented in the [dji-firmware-tools](https://github.com/o-gs/dji-firmware-tools) project.
 
 Each command is a small binary packet with a magic byte (`0x55`), a header with sender and receiver info, a payload, and two CRC checksums. The app builds these packets from JSON profile files and sends them over TCP, one packet per connection.
+
+### Telemetry Research Mode
+
+This fork adds a separate Telemetry tab for raw metadata research. It can stream `RAW_CHUNK` and validated `DUML_FRAME` NDJSON records to a local Mac on port `8765`.
+
+The Android source mode is marked `bench_active_socket`: it opens `127.0.0.1:40009` and reads without writing bytes, but it is still an extra application socket. Treat it as motors-off, propellers-removed bench work only. A local socket EOF is recorded as a `capture_gap`, all georeference fields become `unavailable`, and the source reconnects with bounded backoff and a fresh parser. If DJI Fly reconnects, the control link changes, or the relay queue backs up, stop the test.
+
+For the preferred passive path, use the Mac companion:
+
+```sh
+cd tools/mac-telemetry-receiver
+python -m rc2_telemetry_receiver --adb-pcap --out /Users/jorgen/Documents/RC/captures
+```
+
+The receiver preserves raw bytes and keeps latitude/longitude unknown until a version-scoped field mapping has been verified.
+
+### Research Update Channel
+
+Research builds use `https://api.github.com/repos/jorron87/FreeFCC/releases/latest` by default. The Updates tab also accepts another GitHub Releases API URL or a small manifest URL for fast fork builds:
+
+```json
+{
+  "version": "1.5.3-research.1",
+  "title": "Telemetry relay bugfix",
+  "changelog": "Fix relay reconnect and parser counters.",
+  "apk_url": "https://example.test/FreeFCC-research.apk",
+  "apk_size": 12345678,
+  "sha256": "hex-encoded-sha256",
+  "published_at": "2026-07-22T20:00:00Z"
+}
+```
+
+If `sha256` is present, the app refuses to install an APK whose digest does not match.
+
+Maintainers can build, test, and publish the current version as a GitHub release with:
+
+```sh
+tools/publish-research-release.sh "Short release notes"
+```
 
 ### FCC Profile
 

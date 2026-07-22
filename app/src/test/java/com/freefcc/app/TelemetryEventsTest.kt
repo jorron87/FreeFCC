@@ -1,0 +1,63 @@
+package com.freefcc.app
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class TelemetryEventsTest {
+
+    @Test
+    fun `raw chunk json preserves bytes as base64 and crc32`() {
+        val event = RawChunkEvent(
+            sessionId = "session-1",
+            seq = 7,
+            elapsedRealtimeNs = 123,
+            source = "bench_active_socket",
+            direction = "controller_to_client",
+            port = 40009,
+            bytes = byteArrayOf(0x55, 0x0d, 0x04, 0x01)
+        )
+
+        val line = event.toJsonLine()
+
+        assertTrue(line.contains("\"type\":\"RAW_CHUNK\""))
+        assertTrue(line.contains("\"schema\":\"dji-rc2-telemetry/v1\""))
+        assertTrue(line.contains("\"bytes_b64\":\"VQ0EAQ==\""))
+        assertTrue(line.contains("\"crc32\":\"${crc32Hex(byteArrayOf(0x55, 0x0d, 0x04, 0x01))}\""))
+    }
+
+    @Test
+    fun `candidate event leaves position unknown`() {
+        val line = TelemetryCandidateEvent(
+            sessionId = "session-1",
+            sourceId = "rc2-bench",
+            messageFamily = "03/43",
+            quality = "candidate"
+        ).toJsonLine()
+
+        assertTrue(line.contains("\"lat_deg\":null"))
+        assertTrue(line.contains("\"lon_deg\":null"))
+        assertTrue(line.contains("\"position\":\"unknown\""))
+        assertTrue(line.contains("\"attitude\":\"candidate\""))
+    }
+
+    @Test
+    fun `unavailable event clears every georeference field`() {
+        val line = TelemetryUnavailableEvent(
+            sessionId = "session-1",
+            sourceId = "rc2-bench",
+            reason = "capture gap"
+        ).toJsonLine()
+
+        assertTrue(line.contains("\"lat_deg\":null"))
+        assertTrue(line.contains("\"position\":\"unavailable\""))
+        assertTrue(line.contains("\"attitude\":\"unavailable\""))
+        assertTrue(line.contains("\"gimbal\":\"unavailable\""))
+        assertTrue(line.contains("\"unavailable_reason\":\"capture gap\""))
+    }
+
+    @Test
+    fun `crc32 uses lower-case eight character hex`() {
+        assertEquals("b63cfbcd", crc32Hex(byteArrayOf(1, 2, 3, 4)))
+    }
+}

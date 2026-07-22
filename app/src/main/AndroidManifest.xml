@@ -38,6 +38,11 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
 
+        <service
+            android:name=".TelemetryCaptureService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"
