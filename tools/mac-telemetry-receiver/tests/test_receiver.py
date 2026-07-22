@@ -11,6 +11,7 @@ from pathlib import Path
 from rc2_telemetry_receiver.duml import DumlFrameParser, ParsedFrame, build_test_frame, crc16, crc8
 from rc2_telemetry_receiver.pcap import iter_pcap_tcp_payloads
 from rc2_telemetry_receiver.receiver import SessionWriter, error_event, handle_payload_stream
+from rc2_telemetry_receiver.telemetry import analyze_session, decode_candidate
 
 
 class DumlParserTest(unittest.TestCase):
@@ -81,6 +82,49 @@ class SessionWriterTest(unittest.TestCase):
             self.assertEqual("unavailable", summary["capture_state"])
             self.assertEqual("unavailable", summary["georef"]["quality"]["position"])
 
+    def test_fc_osd_candidate_keeps_position_null(self) -> None:
+        payload = bytearray(48)
+        struct.pack_into("<dd", payload, 0, 0.185, 1.047)
+        struct.pack_into("<h", payload, 16, 123)
+        struct.pack_into("<hhh", payload, 24, 55, -22, 900)
+        event = _frame_event(cmd_set=0x03, cmd_id=0x43, payload=bytes(payload))
+
+        candidate = decode_candidate(event)
+
+        assert candidate is not None
+        self.assertIsNone(candidate["position"]["lat_deg"])
+        self.assertEqual(5.5, candidate["attitude"]["pitch_deg"])
+        self.assertEqual(-2.2, candidate["attitude"]["roll_deg"])
+        self.assertEqual(90.0, candidate["attitude"]["yaw_deg"])
+        self.assertEqual(12.3, candidate["raw"]["relative_height_m_candidate"])
+        self.assertEqual("candidate", candidate["quality"]["attitude"])
+
+    def test_gimbal_candidate_uses_tenth_degree_layout(self) -> None:
+        payload = struct.pack("<hhh", -600, 10, 25) + bytes(6)
+        candidate = decode_candidate(_frame_event(cmd_set=0x04, cmd_id=0x05, payload=payload))
+
+        assert candidate is not None
+        self.assertEqual(-60.0, candidate["gimbal"]["pitch_deg"])
+        self.assertEqual(1.0, candidate["gimbal"]["roll_deg"])
+        self.assertEqual(2.5, candidate["gimbal"]["yaw_deg"])
+        self.assertEqual("candidate", candidate["quality"]["gimbal"])
+
+    def test_analyzer_does_not_classify_rc_channels_as_camera_pitch(self) -> None:
+        rc_payload = b"\x00" + struct.pack("<8H", 256, 0, 1024, 1024, 1024, 1024, 1684, 1024)
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp) / "session.ndjson"
+            session.write_text(json.dumps(_frame_event(cmd_set=0x06, cmd_id=0xAE, payload=rc_payload)) + "\n")
+
+            report = analyze_session(session)
+
+            self.assertEqual(["03/43", "04/05"], report["missing_georeference_families"])
+            self.assertEqual({}, report["candidate_frames"])
+            self.assertEqual(
+                "candidate_rc_channels_not_camera_attitude",
+                report["rc_input_candidate_06_AE"]["classification"],
+            )
+            self.assertEqual(1684, report["rc_input_candidate_06_AE"]["ranges"][6]["max"])
+
 
 class PcapParserTest(unittest.TestCase):
     def test_ipv4_tcp_payload_is_extracted_from_raw_pcap(self) -> None:
@@ -98,6 +142,20 @@ def _tcp_packet(src_port: int, dst_port: int, payload: bytes) -> bytes:
     header[2:4] = dst_port.to_bytes(2, "big")
     header[12] = 5 << 4
     return bytes(header) + payload
+
+
+def _frame_event(*, cmd_set: int, cmd_id: int, payload: bytes) -> dict[str, object]:
+    frame = build_test_frame(cmd_set=cmd_set, cmd_id=cmd_id, payload=payload)
+    return {
+        "type": "DUML_FRAME",
+        "schema": "dji-rc2-telemetry/v1",
+        "session_id": "candidate-session",
+        "wall_time_utc": "2026-07-22T21:00:00.000Z",
+        "source": "unit",
+        "cmd_set": cmd_set,
+        "cmd_id": cmd_id,
+        "raw_frame_b64": base64.b64encode(frame).decode("ascii"),
+    }
 
 
 def _ipv4_packet(tcp: bytes) -> bytes:

@@ -18,3 +18,14 @@ python -m rc2_telemetry_receiver --adb-pcap --out /Users/jorgen/Documents/RC/cap
 
 The tool writes `session.ndjson`, raw chunk files, and `session-summary.json`.
 It does not upload artifacts or promote GPS/attitude fields to verified values.
+
+Analyze a saved session and inventory georeference candidates:
+
+```sh
+python -m rc2_telemetry_receiver --analyze /path/to/session.ndjson
+```
+
+The analyzer implements candidate layouts for `03/43` FC OSD and `04/05`
+gimbal position from the `o-gs/dji-firmware-tools` Wireshark dissectors. GPS
+coordinates and relative height remain raw candidates; latitude, longitude,
+and absolute altitude stay null until controlled correlation verifies them.

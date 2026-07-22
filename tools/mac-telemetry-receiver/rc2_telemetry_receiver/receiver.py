@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .duml import DumlFrameParser, ParseError, ParsedFrame
+from .telemetry import decode_candidate
 
 
 SCHEMA = "dji-rc2-telemetry/v1"
@@ -100,6 +101,16 @@ class SessionStats:
     last_error: str = ""
     capture_state: str = "unknown"
     command_pairs: dict[str, int] = field(default_factory=dict)
+    candidate_events: int = 0
+    attitude: dict[str, float | None] = field(
+        default_factory=lambda: {"roll_deg": None, "pitch_deg": None, "yaw_deg": None}
+    )
+    gimbal: dict[str, float | None] = field(
+        default_factory=lambda: {"roll_deg": None, "pitch_deg": None, "yaw_deg": None}
+    )
+    attitude_quality: str = "unknown"
+    gimbal_quality: str = "unknown"
+    raw_candidate: dict[str, Any] = field(default_factory=lambda: {"message_family": None})
 
 
 class SessionWriter:
@@ -119,6 +130,10 @@ class SessionWriter:
 
         self._append_event(event)
         self._update_stats(event)
+        candidate = decode_candidate(event)
+        if candidate is not None:
+            self._append_event(candidate)
+            self._update_stats(candidate)
         self._write_summary()
 
     def _start_session(self, session_id: str) -> None:
@@ -161,6 +176,7 @@ class SessionWriter:
                 self.stats.capture_gaps += 1
                 self.stats.capture_state = "unavailable"
                 self.stats.last_error = f"capture_gap: {event.get('detail', '')}"
+                self._clear_candidates()
             else:
                 self.stats.parser_errors += 1
                 self.stats.last_error = reason
@@ -168,6 +184,17 @@ class SessionWriter:
             quality = event.get("quality", {})
             if isinstance(quality, dict) and "unavailable" in quality.values():
                 self.stats.capture_state = "unavailable"
+                self._clear_candidates()
+            else:
+                self.stats.candidate_events += 1
+                family = str(event.get("raw", {}).get("message_family") or "")
+                if family == "03/43":
+                    self.stats.attitude = dict(event.get("attitude", self.stats.attitude))
+                    self.stats.attitude_quality = str(quality.get("attitude", "candidate"))
+                elif family == "04/05":
+                    self.stats.gimbal = dict(event.get("gimbal", self.stats.gimbal))
+                    self.stats.gimbal_quality = str(quality.get("gimbal", "candidate"))
+                self.stats.raw_candidate = dict(event.get("raw", self.stats.raw_candidate))
 
     def _write_summary(self) -> None:
         assert self.session_dir is not None
@@ -180,6 +207,7 @@ class SessionWriter:
             "parser_errors": self.stats.parser_errors,
             "capture_gaps": self.stats.capture_gaps,
             "capture_state": self.stats.capture_state,
+            "candidate_events": self.stats.candidate_events,
             "bytes": self.stats.bytes,
             "last_error": self.stats.last_error,
             "command_pairs": dict(sorted(self.stats.command_pairs.items())),
@@ -187,16 +215,27 @@ class SessionWriter:
                 "source_id": self.session_id,
                 "captured_at": utc_now(),
                 "position": {"lat_deg": None, "lon_deg": None, "alt_m": None},
-                "attitude": {"roll_deg": None, "pitch_deg": None, "yaw_deg": None},
-                "gimbal": {"roll_deg": None, "pitch_deg": None, "yaw_deg": None},
+                "attitude": self.stats.attitude,
+                "gimbal": self.stats.gimbal,
                 "quality": {
                     "position": "unavailable" if self.stats.capture_state == "unavailable" else "unknown",
-                    "attitude": "unavailable" if self.stats.capture_state == "unavailable" else "unknown",
+                    "attitude": "unavailable" if self.stats.capture_state == "unavailable" else self.stats.attitude_quality,
+                    "gimbal": "unavailable" if self.stats.capture_state == "unavailable" else self.stats.gimbal_quality,
                 },
-                "raw": {"message_family": None},
+                "raw": self.stats.raw_candidate,
             },
         }
-        (self.session_dir / "session-summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        summary_path = self.session_dir / "session-summary.json"
+        temporary_path = self.session_dir / ".session-summary.json.tmp"
+        temporary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        temporary_path.replace(summary_path)
+
+    def _clear_candidates(self) -> None:
+        self.stats.attitude = {"roll_deg": None, "pitch_deg": None, "yaw_deg": None}
+        self.stats.gimbal = {"roll_deg": None, "pitch_deg": None, "yaw_deg": None}
+        self.stats.attitude_quality = "unknown"
+        self.stats.gimbal_quality = "unknown"
+        self.stats.raw_candidate = {"message_family": None}
 
 
 def listen(bind: str, out_root: Path) -> None:
