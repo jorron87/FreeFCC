@@ -64,6 +64,11 @@ android {
                 signingConfig = null
             }
         }
+        create("research") {
+            initWith(getByName("release"))
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+        }
     }
 
     compileOptions {

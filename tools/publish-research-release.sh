@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT="${0:A:h:h}"
 REPOSITORY="jorron87/FreeFCC"
 GRADLE_FILE="$REPO_ROOT/app/build.gradle.kts"
-APK_PATH="$REPO_ROOT/app/build/outputs/apk/debug/app-debug.apk"
+APK_PATH="$REPO_ROOT/app/build/outputs/apk/research/app-research.apk"
 NOTES="${1:-Research telemetry update}"
 
 VERSION="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' "$GRADLE_FILE" | head -n 1)"
@@ -24,7 +24,7 @@ fi
 cd "$REPO_ROOT"
 JAVA_HOME="${JAVA_HOME:-/opt/homebrew/Cellar/openjdk@17/17.0.19/libexec/openjdk.jdk/Contents/Home}" \
 ANDROID_HOME="${ANDROID_HOME:-/opt/homebrew/share/android-commandlinetools}" \
-    ./gradlew test assembleDebug
+    ./gradlew test assembleResearch
 
 SHA256="$(shasum -a 256 "$APK_PATH" | awk '{print $1}')"
 BODY="$NOTES
