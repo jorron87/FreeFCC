@@ -5,6 +5,9 @@ import binascii
 import json
 import socket
 import sys
+import threading
+import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -111,6 +114,10 @@ class SessionStats:
     attitude_quality: str = "unknown"
     gimbal_quality: str = "unknown"
     raw_candidate: dict[str, Any] = field(default_factory=lambda: {"message_family": None})
+    probe_results: int = 0
+    last_probe: dict[str, Any] = field(default_factory=dict)
+    duml_results: int = 0
+    last_duml: dict[str, Any] = field(default_factory=dict)
 
 
 class SessionWriter:
@@ -195,6 +202,20 @@ class SessionWriter:
                     self.stats.gimbal = dict(event.get("gimbal", self.stats.gimbal))
                     self.stats.gimbal_quality = str(quality.get("gimbal", "candidate"))
                 self.stats.raw_candidate = dict(event.get("raw", self.stats.raw_candidate))
+        elif event_type == "PROBE_RESULT":
+            self.stats.probe_results += 1
+            self.stats.last_probe = dict(event)
+            if event.get("status") == "ok":
+                self.stats.capture_state = "active_probe"
+                self.stats.last_error = ""
+                self.stats.candidate_events += 1
+                self.stats.attitude = dict(event.get("attitude", self.stats.attitude))
+                quality = event.get("quality", {})
+                self.stats.attitude_quality = str(quality.get("attitude", "candidate"))
+                self.stats.raw_candidate = dict(event.get("raw", self.stats.raw_candidate))
+        elif event_type == "DUML_RESULT":
+            self.stats.duml_results += 1
+            self.stats.last_duml = dict(event)
 
     def _write_summary(self) -> None:
         assert self.session_dir is not None
@@ -208,6 +229,10 @@ class SessionWriter:
             "capture_gaps": self.stats.capture_gaps,
             "capture_state": self.stats.capture_state,
             "candidate_events": self.stats.candidate_events,
+            "probe_results": self.stats.probe_results,
+            "last_probe": self.stats.last_probe,
+            "duml_results": self.stats.duml_results,
+            "last_duml": self.stats.last_duml,
             "bytes": self.stats.bytes,
             "last_error": self.stats.last_error,
             "command_pairs": dict(sorted(self.stats.command_pairs.items())),
@@ -238,11 +263,74 @@ class SessionWriter:
         self.stats.raw_candidate = {"message_family": None}
 
 
-def listen(bind: str, out_root: Path) -> None:
+class RelayControlHub:
+    """Correlates local, allowlisted probe requests with the active RC2 socket."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._connection: socket.socket | None = None
+        self._results: dict[str, dict[str, Any]] = {}
+
+    def attach(self, connection: socket.socket) -> None:
+        with self._condition:
+            self._connection = connection
+            self._condition.notify_all()
+
+    def detach(self, connection: socket.socket) -> None:
+        with self._condition:
+            if self._connection is connection:
+                self._connection = None
+            self._condition.notify_all()
+
+    def handle_event(self, event: dict[str, Any]) -> None:
+        if event.get("type") not in ("PROBE_RESULT", "DUML_RESULT"):
+            return
+        request_id = str(event.get("request_id") or "")
+        with self._condition:
+            self._results[request_id] = event
+            self._condition.notify_all()
+
+    def request(self, command: dict[str, Any], timeout: float = 6.0) -> dict[str, Any]:
+        request_id = str(uuid.uuid4())
+        command = {**command, "schema": SCHEMA, "request_id": request_id}
+        with self._condition:
+            connection = self._connection
+            if connection is None:
+                return {"status": "unavailable", "message": "No RC2 relay is connected"}
+            try:
+                connection.sendall((json.dumps(command, separators=(",", ":")) + "\n").encode("utf-8"))
+            except OSError as exc:
+                return {"status": "send_error", "message": str(exc)}
+
+            deadline = time.monotonic() + timeout
+            while request_id not in self._results:
+                if self._connection is not connection:
+                    return {"status": "disconnected", "request_id": request_id}
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {"status": "timeout", "request_id": request_id}
+                self._condition.wait(remaining)
+            return self._results.pop(request_id)
+
+    def request_probe(self, timeout: float = 6.0) -> dict[str, Any]:
+        return self.request(
+            {"type": "PROBE_REQUEST", "probe": "fc_osd_03_43_once"},
+            timeout=timeout,
+        )
+
+
+def listen(bind: str, out_root: Path, control_bind: str = "127.0.0.1:8766") -> None:
     host, port_text = bind.rsplit(":", 1)
     port = int(port_text)
     out_root.mkdir(parents=True, exist_ok=True)
     writers: dict[str, SessionWriter] = {}
+    control_hub = RelayControlHub()
+    threading.Thread(
+        target=_serve_control,
+        args=(control_bind, control_hub),
+        daemon=True,
+        name="rc2-probe-control",
+    ).start()
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -252,6 +340,7 @@ def listen(bind: str, out_root: Path) -> None:
         while True:
             conn, addr = server.accept()
             print(f"client connected from {addr[0]}:{addr[1]}", flush=True)
+            control_hub.attach(conn)
             with conn, conn.makefile("r", encoding="utf-8", newline="\n") as handle:
                 for line in handle:
                     line = line.strip()
@@ -267,8 +356,50 @@ def listen(bind: str, out_root: Path) -> None:
                         writer = SessionWriter(out_root)
                         writers[session_id] = writer
                     writer.handle_event(event)
+                    control_hub.handle_event(event)
                     _print_status(writer.stats)
+            control_hub.detach(conn)
             print("client disconnected", flush=True)
+
+
+def _serve_control(bind: str, hub: RelayControlHub) -> None:
+    host, port_text = bind.rsplit(":", 1)
+    port = int(port_text)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((host, port))
+        server.listen(4)
+        print(f"probe control on {host}:{port}", flush=True)
+        while True:
+            conn, _ = server.accept()
+            with conn, conn.makefile("r", encoding="utf-8", newline="\n") as reader:
+                try:
+                    request = json.loads(reader.readline())
+                    if request.get("probe") == "fc_osd_03_43_once":
+                        response = hub.request_probe()
+                    elif request.get("type") == "DUML_REQUEST":
+                        response = hub.request(request)
+                    else:
+                        response = {"status": "rejected", "message": "Unknown local control request"}
+                except Exception as exc:
+                    response = {"status": "error", "message": str(exc)}
+                conn.sendall((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8"))
+
+
+def request_remote_probe(control_bind: str) -> dict[str, Any]:
+    return send_control_request(control_bind, {"probe": "fc_osd_03_43_once"})
+
+
+def request_remote_duml(control_bind: str, command: dict[str, Any]) -> dict[str, Any]:
+    return send_control_request(control_bind, {"type": "DUML_REQUEST", **command})
+
+
+def send_control_request(control_bind: str, request: dict[str, Any]) -> dict[str, Any]:
+    host, port_text = control_bind.rsplit(":", 1)
+    with socket.create_connection((host, int(port_text)), timeout=8.0) as conn:
+        conn.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
+        with conn.makefile("r", encoding="utf-8", newline="\n") as reader:
+            return json.loads(reader.readline())
 
 
 def handle_payload_stream(*, payloads: Iterable[bytes], out_root: Path, session_id: str, source: str) -> SessionWriter:

@@ -59,7 +59,10 @@ data class AppState(
     val telemetryDjiFlyVersion: String = "",
     val telemetryAircraftModel: String = "",
     val telemetryAircraftFirmware: String = "",
-    val telemetryRuntime: TelemetryRuntimeState = TelemetryRuntimeState()
+    val telemetryRuntime: TelemetryRuntimeState = TelemetryRuntimeState(),
+    val telemetryProbeBusy: Boolean = false,
+    val telemetryProbeResult: TelemetryProbeResult? = null,
+    val telemetryProbeMessage: String = ""
 )
 
 /**
@@ -75,7 +78,7 @@ data class AppState(
 class FccViewModel(private val app: Application) : AndroidViewModel(app) {
 
     companion object {
-        const val APP_VERSION = "1.5.3-research.2"
+        const val APP_VERSION = "1.5.3-research.3"
 
         /**
          * Aircraft model codes known to support DJI Cellular Dongle 2 / 4G.
@@ -234,6 +237,102 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
         TelemetryCaptureService.stop(app)
         TelemetryStatusBus.reset()
         log("Telemetry relay stopped")
+    }
+
+    /**
+     * Sends exactly one read-only 03/43 request while the bench relay is paused.
+     * This intentionally has no retry loop; continuous polling remains disabled.
+     */
+    fun probeTelemetryFcOsd() {
+        if (!beginHardwareOp()) {
+            log("Telemetry probe skipped - another hardware operation is running")
+            return
+        }
+
+        val relayConfig = telemetryConfigOrNull(_state.value)
+        val relayWasRunning = _state.value.telemetryRuntime.running
+        update {
+            copy(
+                telemetryProbeBusy = true,
+                telemetryProbeResult = null,
+                telemetryProbeMessage = "Pausing relay for one 03/43 request..."
+            )
+        }
+        log("Bench probe: preparing one read-only 03/43 request")
+
+        runOnIO {
+            try {
+                if (relayWasRunning) {
+                    TelemetryCaptureService.stop(app)
+                    TelemetryStatusBus.reset()
+                    delay(600)
+                }
+
+                val profile = Profiles.load(app, "telemetry_fc_osd_probe.json")
+                val frame = profile.frames.singleOrNull()
+                    ?: error("Probe profile must contain exactly one frame")
+                val response = transport.sendAndReceive(frame, profile.readWindowMs, profile.port)
+
+                if (response == null) {
+                    update {
+                        copy(
+                            telemetryProbeResult = null,
+                            telemetryProbeMessage = "No matching 03/43 response. No retry was sent."
+                        )
+                    }
+                    log("Bench probe: no matching 03/43 response; no retry sent")
+                } else {
+                    val decoded = TelemetryProbeDecoder.decode(response)
+                    if (decoded == null) {
+                        update {
+                            copy(
+                                telemetryProbeResult = null,
+                                telemetryProbeMessage = "03/43 response was ${response.size} bytes; candidate layout needs at least 30."
+                            )
+                        }
+                        log("Bench probe: 03/43 response too short (${response.size} bytes)")
+                    } else {
+                        update {
+                            copy(
+                                telemetryProbeResult = decoded,
+                                telemetryProbeMessage = "Candidate data received. GPS remains unverified."
+                            )
+                        }
+                        log("Bench probe: candidate 03/43 payload received (${response.size} bytes)")
+                    }
+                }
+            } catch (e: Exception) {
+                update {
+                    copy(
+                        telemetryProbeResult = null,
+                        telemetryProbeMessage = "Probe error: ${e.message.orEmpty()}"
+                    )
+                }
+                log("Bench probe error: ${e.message.orEmpty()}")
+            } finally {
+                endHardwareOp()
+                if (relayWasRunning && relayConfig != null) {
+                    delay(400)
+                    TelemetryCaptureService.start(app, relayConfig)
+                    log("Telemetry relay restarting after bench probe")
+                }
+                update { copy(telemetryProbeBusy = false) }
+            }
+        }
+    }
+
+    private fun telemetryConfigOrNull(current: AppState): TelemetryConfig? {
+        val port = current.telemetryPort.toIntOrNull()
+        if (current.telemetryHost.isBlank() || port == null || port !in 1..65535) return null
+        return TelemetryConfig(
+            host = current.telemetryHost,
+            port = port,
+            sourceId = current.telemetrySourceId.ifBlank { "rc2-bench" },
+            controllerFirmware = current.telemetryControllerFirmware,
+            djiFlyVersion = current.telemetryDjiFlyVersion,
+            aircraftModel = current.telemetryAircraftModel,
+            aircraftFirmware = current.telemetryAircraftFirmware
+        )
     }
 
     // --- Auto-FCC ---

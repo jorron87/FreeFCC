@@ -209,7 +209,7 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
 
             Spacer(Modifier.height(16.dp))
             BodyText(
-                "Bench-only source: opens 127.0.0.1:40009 and sends no bytes. Stop if DJI Fly reconnects or control link changes.",
+                "Bench-only source: passive until an explicit UI or Mac DUML command. Stop if DJI Fly reconnects or control link changes.",
                 Amber
             )
 
@@ -300,6 +300,53 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
         Spacer(Modifier.height(16.dp))
 
         GlowCard {
+            Text("Bench probe", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(10.dp))
+            BodyText(
+                "Sends one read-only 03/43 request. The relay pauses, then restarts with a new session. The Mac relay may also issue logged one-frame DUML research commands.",
+                Amber
+            )
+            Spacer(Modifier.height(14.dp))
+            GlowButton(
+                text = if (state.telemetryProbeBusy) "Probing..." else "Probe GPS / attitude",
+                color = Amber,
+                enabled = !state.telemetryProbeBusy && !state.isHardwareBusy
+            ) { viewModel.probeTelemetryFcOsd() }
+
+            if (state.telemetryProbeMessage.isNotEmpty()) {
+                Spacer(Modifier.height(14.dp))
+                BodyText(state.telemetryProbeMessage, if (state.telemetryProbeResult != null) Green else TextGray)
+            }
+
+            state.telemetryProbeResult?.let { result ->
+                Spacer(Modifier.height(14.dp))
+                DividerLine()
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Quality", "CANDIDATE / UNVERIFIED", Amber)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Payload", "${result.payloadSize} bytes", TextWhite)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Longitude raw", candidateNumber(result.longitudeRaw, 9), TextGray)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Latitude raw", candidateNumber(result.latitudeRaw, 9), TextGray)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Longitude deg?", candidateNumber(result.longitudeRadiansCandidateDeg, 6), Cyan)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Latitude deg?", candidateNumber(result.latitudeRadiansCandidateDeg, 6), Cyan)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Relative height?", "${candidateNumber(result.relativeHeightCandidateM, 1)} m", Cyan)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Aircraft pitch?", "${candidateNumber(result.pitchCandidateDeg, 1)} deg", Green)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Aircraft roll?", "${candidateNumber(result.rollCandidateDeg, 1)} deg", Green)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Aircraft yaw?", "${candidateNumber(result.yawCandidateDeg, 1)} deg", Green)
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        GlowCard {
             Text("Counters", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(12.dp))
             InfoRow("Raw chunks", runtime.rawChunks.toString(), Cyan)
@@ -322,6 +369,9 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
         }
     }
 }
+
+private fun candidateNumber(value: Double?, decimals: Int): String =
+    value?.let { String.format(java.util.Locale.US, "%.${decimals}f", it) } ?: "unknown"
 
 // ═══════════════════════════════════════════════════════════════════════
 // Page 1: FCC

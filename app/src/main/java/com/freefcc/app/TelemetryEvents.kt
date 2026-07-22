@@ -141,6 +141,51 @@ data class TelemetryErrorEvent(
     )
 }
 
+data class TelemetryProbeResultEvent(
+    val sessionId: String,
+    val requestId: String,
+    val status: String,
+    val message: String,
+    val payload: ByteArray? = null,
+    val result: TelemetryProbeResult? = null
+) : TelemetryEvent("PROBE_RESULT") {
+    override fun toJsonLine(): String {
+        val quality = if (result != null && status == "ok") "candidate" else "unavailable"
+        return """
+            {"type":"$type","schema":"$TELEMETRY_SCHEMA","session_id":"${esc(sessionId)}","request_id":"${esc(requestId)}","probe":"fc_osd_03_43_once","captured_at":"${utcNow()}","status":"${esc(status)}","message":"${esc(message)}","position":{"lat_deg":null,"lon_deg":null,"alt_m":null},"attitude":{"roll_deg":${numberOrNull(result?.rollCandidateDeg)},"pitch_deg":${numberOrNull(result?.pitchCandidateDeg)},"yaw_deg":${numberOrNull(result?.yawCandidateDeg)}},"gimbal":{"roll_deg":null,"pitch_deg":null,"yaw_deg":null},"quality":{"position":"unknown","attitude":"$quality","gimbal":"unknown"},"raw":{"message_family":"03/43","payload_b64":${nullable(payload?.let(::b64))},"longitude_raw_f64":${numberOrNull(result?.longitudeRaw)},"latitude_raw_f64":${numberOrNull(result?.latitudeRaw)},"longitude_if_radians_deg":${numberOrNull(result?.longitudeRadiansCandidateDeg)},"latitude_if_radians_deg":${numberOrNull(result?.latitudeRadiansCandidateDeg)},"relative_height_m_candidate":${numberOrNull(result?.relativeHeightCandidateM)}}}
+        """.trimIndent()
+    }
+}
+
+data class TelemetryDumlResultEvent(
+    val sessionId: String,
+    val requestId: String,
+    val command: TelemetryRelayCommand.Duml,
+    val status: String,
+    val message: String,
+    val responsePayload: ByteArray? = null
+) : TelemetryEvent("DUML_RESULT") {
+    override fun toJsonLine(): String = """
+        {"type":"$type","schema":"$TELEMETRY_SCHEMA","session_id":"${esc(sessionId)}","request_id":"${esc(requestId)}","captured_at":"${utcNow()}","status":"${esc(status)}","message":"${esc(message)}","request":{"sender":${command.sender},"destination":${command.destination},"cmd_type":${command.cmdType},"cmd_set":${command.cmdSet},"cmd_id":${command.cmdId},"payload_b64":"${b64(command.payload)}","expect_response":${command.expectResponse},"read_window_ms":${command.readWindowMs},"port":${command.port}},"response":{"payload_b64":${nullable(responsePayload?.let(::b64))},"payload_length":${responsePayload?.size ?: 0}}}
+    """.trimIndent()
+}
+
+data class TelemetryDumlRejectedEvent(
+    val sessionId: String,
+    val requestId: String,
+    val message: String
+) : TelemetryEvent("DUML_RESULT") {
+    override fun toJsonLine(): String = jsonObject(
+        "type" to type,
+        "schema" to TELEMETRY_SCHEMA,
+        "session_id" to sessionId,
+        "request_id" to requestId,
+        "captured_at" to utcNow(),
+        "status" to "rejected",
+        "message" to message
+    )
+}
+
 fun newTelemetrySessionId(): String = UUID.randomUUID().toString()
 
 fun crc32Hex(bytes: ByteArray): String {
@@ -154,6 +199,9 @@ private const val TELEMETRY_SCHEMA = "dji-rc2-telemetry/v1"
 private fun b64(bytes: ByteArray): String = Base64.getEncoder().encodeToString(bytes)
 
 private fun nullable(value: String?): String = value?.let { "\"${esc(it)}\"" } ?: "null"
+
+private fun numberOrNull(value: Double?): String =
+    if (value != null && value.isFinite()) value.toString() else "null"
 
 private fun jsonObject(vararg fields: Pair<String, Any>): String =
     fields.joinToString(prefix = "{", postfix = "}") { (key, value) ->

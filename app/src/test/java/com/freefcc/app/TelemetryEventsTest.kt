@@ -60,4 +60,38 @@ class TelemetryEventsTest {
     fun `crc32 uses lower-case eight character hex`() {
         assertEquals("b63cfbcd", crc32Hex(byteArrayOf(1, 2, 3, 4)))
     }
+
+    @Test
+    fun `probe result preserves request correlation and candidate quality`() {
+        val payload = ByteArray(30)
+        val result = TelemetryProbeDecoder.decode(payload)
+        val line = TelemetryProbeResultEvent(
+            sessionId = "session-1",
+            requestId = "request-7",
+            status = "ok",
+            message = "candidate",
+            payload = payload,
+            result = result
+        ).toJsonLine()
+
+        assertTrue(line.contains("\"type\":\"PROBE_RESULT\""))
+        assertTrue(line.contains("\"request_id\":\"request-7\""))
+        assertTrue(line.contains("\"probe\":\"fc_osd_03_43_once\""))
+        assertTrue(line.contains("\"position\":{\"lat_deg\":null,\"lon_deg\":null"))
+        assertTrue(line.contains("\"attitude\":\"candidate\""))
+    }
+
+    @Test
+    fun `rejected general command remains a duml result`() {
+        val line = TelemetryDumlRejectedEvent(
+            sessionId = "session-1",
+            requestId = "request-8",
+            message = "invalid"
+        ).toJsonLine()
+
+        assertTrue(line.contains("\"type\":\"DUML_RESULT\""))
+        assertTrue(line.contains("\"request_id\":\"request-8\""))
+        assertTrue(line.contains("\"status\":\"rejected\""))
+        assertTrue(!line.contains("fc_osd_03_43_once"))
+    }
 }

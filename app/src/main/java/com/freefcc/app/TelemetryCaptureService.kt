@@ -14,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -21,6 +22,7 @@ import kotlinx.coroutines.launch
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicBoolean
 
 class TelemetryCaptureService : Service() {
 
@@ -28,6 +30,10 @@ class TelemetryCaptureService : Service() {
     private var relay: TelemetryRelayClient? = null
     private var captureJob: Job? = null
     private var captureSocket: Socket? = null
+    private var activeConfig: TelemetryConfig? = null
+    private val probeTransport = DumlTransport()
+    private val commandInFlight = AtomicBoolean(false)
+    private var lastCommandStartedElapsedMs = 0L
     private var sessionId: String = ""
     private var rawSeq = 0L
     private var rawChunks = 0L
@@ -67,6 +73,7 @@ class TelemetryCaptureService : Service() {
             aircraftModel = intent.getStringExtra(EXTRA_AIRCRAFT_MODEL).orEmpty(),
             aircraftFirmware = intent.getStringExtra(EXTRA_AIRCRAFT_FIRMWARE).orEmpty()
         )
+        activeConfig = config
         sessionId = newTelemetrySessionId()
         rawSeq = 0L
         rawChunks = 0L
@@ -99,11 +106,190 @@ class TelemetryCaptureService : Service() {
             controllerModel = Build.DEVICE,
             scope = scope,
             onStatus = { TelemetryStatusBus.update(it) },
+            onCommand = ::handleRelayCommand,
             onFatal = { reason -> failClosed(reason) }
         ).also { it.start() }
 
         captureJob = scope.launch {
             runBenchSocketCapture(config)
+        }
+    }
+
+    private fun handleRelayCommand(command: TelemetryRelayCommand) {
+        if (!commandInFlight.compareAndSet(false, true)) {
+            sendRelayFailure(command, "busy", "Another DUML command is already running")
+            return
+        }
+
+        scope.launch {
+            var hardwareLockHeld = false
+            var capturePaused = false
+            val config = activeConfig
+            try {
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastCommandStartedElapsedMs < MIN_COMMAND_INTERVAL_MS) {
+                    sendRelayFailure(command, "rate_limited", "Wait before requesting another DUML command")
+                    return@launch
+                }
+                lastCommandStartedElapsedMs = now
+
+                if (!HardwareLock.tryBegin()) {
+                    sendRelayFailure(command, "busy", "Controller hardware is busy")
+                    return@launch
+                }
+                hardwareLockHeld = true
+
+                if (config == null) {
+                    sendRelayFailure(command, "error", "Telemetry session configuration is unavailable")
+                    return@launch
+                }
+
+                val oldCaptureJob = captureJob
+                captureJob = null
+                try { captureSocket?.close() } catch (_: Exception) {}
+                captureSocket = null
+                oldCaptureJob?.cancelAndJoin()
+                capturePaused = true
+
+                relay?.enqueue(
+                    TelemetryUnavailableEvent(
+                        sessionId = sessionId,
+                        sourceId = config.sourceId,
+                        reason = "active remote DUML request"
+                    )
+                )
+                TelemetryStatusBus.update(
+                    TelemetryStatus(
+                        running = true,
+                        connecting = true,
+                        lastError = "Metadata unavailable during one-shot DUML request"
+                    )
+                )
+                delay(PROBE_SOCKET_SETTLE_MS)
+
+                when (command) {
+                    is TelemetryRelayCommand.Probe -> executeFcOsdProbe(command)
+                    is TelemetryRelayCommand.Duml -> executeDumlRequest(command)
+                }
+            } catch (e: Exception) {
+                sendRelayFailure(command, "error", e.message.orEmpty().ifBlank { "DUML request failed" })
+            } finally {
+                if (hardwareLockHeld) HardwareLock.end()
+                if (capturePaused && config != null && scope.coroutineContext.isActive) {
+                    delay(PROBE_RESTART_DELAY_MS)
+                    captureJob = scope.launch { runBenchSocketCapture(config) }
+                }
+                commandInFlight.set(false)
+            }
+        }
+    }
+
+    private fun executeFcOsdProbe(command: TelemetryRelayCommand.Probe) {
+        val profile = Profiles.load(this, "telemetry_fc_osd_probe.json")
+        val frame = profile.frames.singleOrNull()
+            ?: error("Probe profile must contain exactly one frame")
+        val payload = probeTransport.sendAndReceive(frame, profile.readWindowMs, profile.port)
+        if (payload == null) {
+            sendProbeResult(command.requestId, "no_response", "No matching 03/43 response; no retry sent")
+            return
+        }
+
+        val decoded = TelemetryProbeDecoder.decode(payload)
+        if (decoded == null) {
+            sendProbeResult(
+                command.requestId,
+                "layout_mismatch",
+                "03/43 payload was ${payload.size} bytes; expected at least 30",
+                payload
+            )
+        } else {
+            sendProbeResult(
+                command.requestId,
+                "ok",
+                "Candidate data received; GPS remains unverified",
+                payload,
+                decoded
+            )
+        }
+    }
+
+    private fun executeDumlRequest(command: TelemetryRelayCommand.Duml) {
+        val frame = DumlBuilder().buildFrame(
+            DumlFrame(
+                sender = command.sender,
+                dst = command.destination,
+                cmdType = command.cmdType,
+                cmdSet = command.cmdSet,
+                cmdId = command.cmdId,
+                payload = command.payload
+            )
+        )
+        if (command.expectResponse) {
+            val response = probeTransport.sendAndReceive(frame, command.readWindowMs, command.port)
+            sendDumlResult(
+                command = command,
+                status = if (response == null) "no_response" else "ok",
+                message = if (response == null) "No matching response; no retry sent" else "Matching response received",
+                responsePayload = response
+            )
+        } else {
+            val sent = probeTransport.sendFrames(
+                frames = listOf(frame),
+                rounds = 1,
+                interFrameDelayMs = 0,
+                interRoundDelayMs = 0,
+                readWindowMs = command.readWindowMs,
+                port = command.port
+            )
+            sendDumlResult(
+                command = command,
+                status = if (sent) "sent" else "send_failed",
+                message = if (sent) "One DUML frame sent" else "DUML frame could not be sent"
+            )
+        }
+    }
+
+    private fun sendProbeResult(
+        requestId: String,
+        status: String,
+        message: String,
+        payload: ByteArray? = null,
+        result: TelemetryProbeResult? = null
+    ) {
+        relay?.enqueue(
+            TelemetryProbeResultEvent(
+                sessionId = sessionId,
+                requestId = requestId,
+                status = status,
+                message = message,
+                payload = payload,
+                result = result
+            )
+        )
+    }
+
+    private fun sendDumlResult(
+        command: TelemetryRelayCommand.Duml,
+        status: String,
+        message: String,
+        responsePayload: ByteArray? = null
+    ) {
+        relay?.enqueue(
+            TelemetryDumlResultEvent(
+                sessionId = sessionId,
+                requestId = command.requestId,
+                command = command,
+                status = status,
+                message = message,
+                responsePayload = responsePayload
+            )
+        )
+    }
+
+    private fun sendRelayFailure(command: TelemetryRelayCommand, status: String, message: String) {
+        when (command) {
+            is TelemetryRelayCommand.Probe -> sendProbeResult(command.requestId, status, message)
+            is TelemetryRelayCommand.Duml -> sendDumlResult(command, status, message)
         }
     }
 
@@ -241,6 +427,7 @@ class TelemetryCaptureService : Service() {
         captureSocket = null
         relay?.stop()
         relay = null
+        activeConfig = null
         TelemetryStatusBus.update(TelemetryStatus(running = false, connecting = false, relayConnected = false, queueDepth = 0))
         if (closeService) {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -291,6 +478,9 @@ class TelemetryCaptureService : Service() {
         private const val DUML_CONNECT_TIMEOUT_MS = 2_000
         private const val BENCH_RECONNECT_INITIAL_MS = 1_000L
         private const val BENCH_RECONNECT_MAX_MS = 5_000L
+        private const val MIN_COMMAND_INTERVAL_MS = 500L
+        private const val PROBE_SOCKET_SETTLE_MS = 200L
+        private const val PROBE_RESTART_DELAY_MS = 250L
         private const val DEFAULT_RELAY_PORT = 8765
 
         private const val ACTION_START = "com.freefcc.app.telemetry.START"

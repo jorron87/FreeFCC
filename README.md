@@ -180,7 +180,9 @@ Each command is a small binary packet with a magic byte (`0x55`), a header with 
 
 This fork adds a separate Telemetry tab for raw metadata research. It can stream `RAW_CHUNK` and validated `DUML_FRAME` NDJSON records to a local Mac on port `8765`.
 
-The Android source mode is marked `bench_active_socket`: it opens `127.0.0.1:40009` and reads without writing bytes, but it is still an extra application socket. Treat it as motors-off, propellers-removed bench work only. A local socket EOF is recorded as a `capture_gap`, all georeference fields become `unavailable`, and the source reconnects with bounded backoff and a fresh parser. If DJI Fly reconnects, the control link changes, or the relay queue backs up, stop the test.
+The Android source mode is marked `bench_active_socket`: it opens `127.0.0.1:40009` and reads without writing unless a bench probe is explicitly requested. Treat it as motors-off, propellers-removed bench work only. A local socket EOF is recorded as a `capture_gap`, all georeference fields become `unavailable`, and the source reconnects with bounded backoff and a fresh parser. If DJI Fly reconnects, the control link changes, or the relay queue backs up, stop the test.
+
+The receiver also exposes a Mac-local control socket on `127.0.0.1:8766`. It can request the predefined one-shot `03/43` candidate decoder or send one structured DUML frame. Commands are correlated by `request_id`, recorded as `PROBE_RESULT` or `DUML_RESULT`, limited to a 512-byte payload and a bounded response window, and never retried automatically.
 
 For the preferred passive path, use the Mac companion:
 

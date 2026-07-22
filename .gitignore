@@ -10,6 +10,8 @@ local.properties
 app/build/
 gradle/.gradle/
 *.idsig
+__pycache__/
+*.pyc
 .kotlin/
 
 REMOTE_ID_INTERNAL.md
@@ -19,4 +21,3 @@ REVERSE_ENGINEERING.md
 keystore.properties
 *.jks
 *.keystore
-

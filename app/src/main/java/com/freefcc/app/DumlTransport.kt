@@ -293,29 +293,24 @@ class DumlTransport {
             socket = Socket()
             socket.connect(InetSocketAddress(HOST, effectivePort), CONNECT_TIMEOUT_MS)
             socket.tcpNoDelay = true
-            socket.soTimeout = readWindowMs
 
             socket.getOutputStream().apply { write(frame); flush() }
 
             val input = socket.getInputStream()
-            val header = readBytes(input, 11) ?: return null
+            val deadlineNs = System.nanoTime() + readWindowMs.coerceAtLeast(1) * 1_000_000L
+            while (true) {
+                val remainingNs = deadlineNs - System.nanoTime()
+                if (remainingNs <= 0) return null
+                socket.soTimeout = ((remainingNs + 999_999L) / 1_000_000L)
+                    .coerceIn(1L, Int.MAX_VALUE.toLong())
+                    .toInt()
 
-            // Guard against a short read returning fewer than 3 bytes —
-            // indexing header[0..2] for magic/length would otherwise throw.
-            if (header.size < 3) return null
-
-            // Verify magic byte before trusting the encoded length enough to read more
-            if (header[0] != 0x55.toByte()) return null
-
-            // Extract total length from bytes 1-2 (11-bit LE) to know how much more to read
-            val totalLength = (header[1].toInt() and 0xFF) or ((header[2].toInt() and 0x03) shl 8)
-            if (totalLength < 13 || totalLength > 1023) return null
-
-            // Read the rest (payload + 2 CRC bytes)
-            val remaining = readBytes(input, totalLength - 11) ?: return null
-            val response = header + remaining
-
-            return DumlBuilder.validateResponse(frame, response)
+                val response = readDumlFrame(input) ?: return null
+                val payload = DumlBuilder.validateResponse(frame, response)
+                if (payload != null) return payload
+                // The proxy can interleave unsolicited telemetry. Keep reading
+                // until the bounded deadline for the response matching this request.
+            }
 
         } catch (_: IOException) {
             return null
@@ -536,12 +531,24 @@ class DumlTransport {
         return allSuccess
     }
 
+    private fun readDumlFrame(input: java.io.InputStream): ByteArray? {
+        val header = readBytes(input, 11) ?: return null
+        if (header[0] != 0x55.toByte()) return null
+
+        val totalLength = (header[1].toInt() and 0xFF) or ((header[2].toInt() and 0x03) shl 8)
+        if (totalLength !in 13..1023) return null
+
+        val remaining = readBytes(input, totalLength - 11) ?: return null
+        return header + remaining
+    }
+
+    @Throws(IOException::class)
     private fun readBytes(input: java.io.InputStream, count: Int): ByteArray? {
         val out = ByteArray(count)
         var read = 0
         while (read < count) {
-            val n = try { input.read(out, read, count - read) } catch (_: IOException) { return null }
-            if (n <= 0) return if (read > 0) out.copyOf(read) else null
+            val n = input.read(out, read, count - read)
+            if (n <= 0) return null
             read += n
         }
         return out
