@@ -165,7 +165,7 @@ class TelemetryRelayClient(
         if (payload.size > MAX_REMOTE_PAYLOAD_BYTES) return null
         val readWindowMs = obj.optInt("read_window_ms", 1000).coerceIn(20, 5_000)
         val port = obj.optInt("port", DumlTransport.PORT)
-        if (port !in REMOTE_DUML_PORTS) return null
+        if (port !in RESEARCH_DUML_PORTS) return null
         return TelemetryRelayCommand.Duml(
             requestId = requestId,
             sender = sender,
@@ -206,7 +206,7 @@ class TelemetryRelayClient(
         private const val MAX_QUEUE_EVENTS = 512
         private const val ALLOWED_PROBE = "fc_osd_03_43_once"
         private const val MAX_REMOTE_PAYLOAD_BYTES = 512
-        private val REMOTE_DUML_PORTS = setOf(40009, 40007, 8901, 8902, 8903, 8904)
+        val RESEARCH_DUML_PORTS = setOf(40009, 40007, 8901, 8902, 8903, 8904)
     }
 }
 
@@ -216,6 +216,8 @@ data class TelemetryStatus(
     val relayConnected: Boolean? = null,
     val sessionId: String? = null,
     val sourceMode: String? = null,
+    val sourcePort: Int? = null,
+    val captureActive: Boolean? = null,
     val rawChunks: Long? = null,
     val frames: Long? = null,
     val parserErrors: Long? = null,
@@ -230,6 +232,8 @@ data class TelemetryRuntimeState(
     val relayConnected: Boolean = false,
     val sessionId: String = "",
     val sourceMode: String = "",
+    val sourcePort: Int = DumlTransport.PORT_LED,
+    val captureActive: Boolean = false,
     val rawChunks: Long = 0,
     val frames: Long = 0,
     val parserErrors: Long = 0,
@@ -243,6 +247,8 @@ data class TelemetryRuntimeState(
         relayConnected = status.relayConnected ?: relayConnected,
         sessionId = status.sessionId ?: sessionId,
         sourceMode = status.sourceMode ?: sourceMode,
+        sourcePort = status.sourcePort ?: sourcePort,
+        captureActive = status.captureActive ?: captureActive,
         rawChunks = status.rawChunks ?: rawChunks,
         frames = status.frames ?: frames,
         parserErrors = status.parserErrors ?: parserErrors,

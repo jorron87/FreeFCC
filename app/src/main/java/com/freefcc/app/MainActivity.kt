@@ -159,6 +159,7 @@ private fun AppRoot(viewModel: FccViewModel) {
 // Page 3: Telemetry research
 // ═══════════════════════════════════════════════════════════════════════
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
     val runtime = state.telemetryRuntime
@@ -178,7 +179,8 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                 StatusDot(
                     when {
-                        runtime.running && runtime.relayConnected -> Green
+                        runtime.running && runtime.relayConnected && runtime.captureActive -> Green
+                        runtime.running && runtime.relayConnected -> Amber
                         runtime.running || runtime.connecting -> Amber
                         runtime.lastError.isNotEmpty() -> Red
                         else -> TextDim
@@ -188,7 +190,8 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         when {
-                            runtime.running && runtime.relayConnected -> "Streaming to Mac"
+                            runtime.running && runtime.relayConnected && runtime.captureActive -> "Streaming to Mac"
+                            runtime.running && runtime.relayConnected -> "Relay connected; capture stopped"
                             runtime.running || runtime.connecting -> "Starting relay"
                             runtime.lastError.isNotEmpty() -> "Stopped fail-closed"
                             else -> "Stopped"
@@ -199,7 +202,7 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        runtime.sourceMode.ifBlank { "bench_active_socket" },
+                        "${runtime.sourceMode.ifBlank { "bench_wrapped_socket" }}:${runtime.sourcePort}",
                         color = Amber,
                         fontSize = 12.sp,
                         fontFamily = FontFamily.Monospace
@@ -209,7 +212,7 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
 
             Spacer(Modifier.height(16.dp))
             BodyText(
-                "Bench-only source: passive until an explicit UI or Mac DUML command. Stop if DJI Fly reconnects or control link changes.",
+                "Bench-only read-only capture. One socket is opened per explicit start and is never reconnected automatically. Stop if DJI Fly reconnects or the control link changes.",
                 Amber
             )
 
@@ -251,6 +254,31 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 placeholder = "rc2-bench",
                 enabled = !runtime.running
             )
+            Spacer(Modifier.height(14.dp))
+            Text("DUML capture port", color = TextGray, fontSize = 12.sp)
+            Spacer(Modifier.height(8.dp))
+            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                listOf("40007 Wrapped" to "40007", "40009 Direct" to "40009").forEachIndexed { index, choice ->
+                    SegmentedButton(
+                        selected = state.telemetryCapturePort == choice.second,
+                        onClick = { viewModel.updateTelemetryCapturePort(choice.second) },
+                        shape = SegmentedButtonDefaults.itemShape(index, 2),
+                        enabled = !runtime.running
+                    ) {
+                        Text(choice.first, fontSize = 12.sp)
+                    }
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            ResearchTextField(
+                value = state.telemetryCapturePort,
+                onValueChange = viewModel::updateTelemetryCapturePort,
+                label = "Custom supported port",
+                placeholder = "40007",
+                enabled = !runtime.running
+            )
+            Spacer(Modifier.height(8.dp))
+            BodyText("Supported research ports: 40007, 40009, 8901-8904.", TextDim)
             Spacer(Modifier.height(18.dp))
             if (runtime.running) {
                 GlowButton("Stop Relay", Red) { viewModel.stopTelemetryRelay() }
@@ -303,7 +331,7 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
             Text("Bench probe", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(10.dp))
             BodyText(
-                "Sends one read-only 03/43 request. The relay pauses, then restarts with a new session. The Mac relay may also issue logged one-frame DUML research commands.",
+                "Sends one read-only 03/43 request on 40009. Mac-local control may issue any bounded structured DUML command on a selected supported port. A port held by capture is rejected instead of reconnecting it.",
                 Amber
             )
             Spacer(Modifier.height(14.dp))

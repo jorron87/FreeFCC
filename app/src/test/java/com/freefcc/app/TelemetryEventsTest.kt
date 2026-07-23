@@ -62,6 +62,24 @@ class TelemetryEventsTest {
     }
 
     @Test
+    fun `hello records wrapped source port`() {
+        val line = TelemetryHelloEvent(
+            sessionId = "session-1",
+            config = TelemetryConfig(
+                host = "192.168.5.99",
+                port = 8765,
+                sourceId = "neo2",
+                capturePort = 40007
+            ),
+            appVersion = "test",
+            controllerModel = "rc331"
+        ).toJsonLine()
+
+        assertTrue(line.contains("\"source_mode\":\"bench_wrapped_socket\""))
+        assertTrue(line.contains("\"source_port\":40007"))
+    }
+
+    @Test
     fun `probe result preserves request correlation and candidate quality`() {
         val payload = ByteArray(30)
         val result = TelemetryProbeDecoder.decode(payload)
@@ -71,7 +89,11 @@ class TelemetryEventsTest {
             status = "ok",
             message = "candidate",
             payload = payload,
-            result = result
+            result = result,
+            exchange = DumlExchangeResult(
+                terminalReason = "matched",
+                observations = listOf(DumlResponseObservation(byteArrayOf(0x55), "matched"))
+            )
         ).toJsonLine()
 
         assertTrue(line.contains("\"type\":\"PROBE_RESULT\""))
@@ -79,6 +101,8 @@ class TelemetryEventsTest {
         assertTrue(line.contains("\"probe\":\"fc_osd_03_43_once\""))
         assertTrue(line.contains("\"position\":{\"lat_deg\":null,\"lon_deg\":null"))
         assertTrue(line.contains("\"attitude\":\"candidate\""))
+        assertTrue(line.contains("\"terminal_reason\":\"matched\""))
+        assertTrue(line.contains("\"validation\":\"matched\""))
     }
 
     @Test

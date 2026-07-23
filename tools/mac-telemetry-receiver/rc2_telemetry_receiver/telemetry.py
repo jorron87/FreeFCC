@@ -4,6 +4,7 @@ import base64
 import collections
 import json
 import math
+import re
 import struct
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,49 @@ def decode_candidate(event: dict[str, Any]) -> dict[str, Any] | None:
             "raw": {"message_family": "04/05", "layout_reference": LAYOUT_REFERENCE},
         }
 
+    if cmd_set == 0x03 and cmd_id == 0x44 and len(payload) >= 22:
+        home_state = struct.unpack_from("<H", payload, 20)[0]
+        return {
+            **common,
+            "position": {"lat_deg": None, "lon_deg": None, "alt_m": None},
+            "attitude": {"roll_deg": None, "pitch_deg": None, "yaw_deg": None},
+            "gimbal": {"roll_deg": None, "pitch_deg": None, "yaw_deg": None},
+            "quality": {"position": "unknown", "attitude": "unknown", "gimbal": "unknown"},
+            "raw": {
+                "message_family": "03/44",
+                "layout_reference": "SkylabFCCfree live map, model-specific candidate",
+                "home_state_raw_u16": home_state,
+                "home_point_recorded_candidate": bool(home_state & 0x01),
+            },
+        }
+
+    if (
+        cmd_set == 0x51
+        and cmd_id == 0x14
+        and int(event.get("sender", -1)) == 0xEE
+        and (int(event.get("receiver", -1)) & 0x1F) == 0x02
+        and event.get("validation_status") == "valid"
+    ):
+        identity = _identity_candidates(payload)
+        if any(identity.values()):
+            return {
+                **common,
+                "position": {"lat_deg": None, "lon_deg": None, "alt_m": None},
+                "attitude": {"roll_deg": None, "pitch_deg": None, "yaw_deg": None},
+                "gimbal": {"roll_deg": None, "pitch_deg": None, "yaw_deg": None},
+                "identity": identity,
+                "quality": {
+                    "position": "unknown",
+                    "attitude": "unknown",
+                    "gimbal": "unknown",
+                    "identity": "candidate",
+                },
+                "raw": {
+                    "message_family": "51/14",
+                    "layout_reference": "SkylabFCCfree live map, frame-scoped extraction",
+                },
+            }
+
     return None
 
 
@@ -105,7 +149,10 @@ def analyze_session(path: Path) -> dict[str, Any]:
         "frame_families": dict(sorted(families.items())),
         "candidate_frames": dict(sorted(candidates.items())),
         "latest_candidates": latest_candidates,
-        "missing_georeference_families": [family for family in ("03/43", "04/05") if not families[family]],
+        "missing_georeference_families": [
+            family for family in ("03/43", "03/44", "04/05") if not families[family]
+        ],
+        "missing_identity_families": [family for family in ("51/14",) if not families[family]],
         "rc_input_candidate_06_AE": {
             "classification": "candidate_rc_channels_not_camera_attitude",
             "ranges": rc_ranges,
@@ -126,3 +173,17 @@ def _radians_candidate(value: float, bound: float) -> float | None:
     if not math.isfinite(value) or abs(value) > bound:
         return None
     return math.degrees(value)
+
+
+def _identity_candidates(payload: bytes) -> dict[str, str | None]:
+    upper = payload.upper()
+
+    def match(pattern: bytes) -> str | None:
+        found = re.search(pattern, upper)
+        return found.group().decode("ascii") if found else None
+
+    return {
+        "aircraft_serial": match(rb"(?<![A-Z0-9])1581[A-Z0-9]{12,18}(?![A-Z0-9])"),
+        "serial_suffix": match(rb"(?<![A-Z0-9])FA[A-Z0-9]{14}(?![A-Z0-9])"),
+        "model_code": match(rb"(?<![A-Z0-9])W[AM][0-9]{3}(?![A-Z0-9])"),
+    }

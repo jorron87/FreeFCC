@@ -10,9 +10,22 @@ import threading
 import unittest
 from pathlib import Path
 
-from rc2_telemetry_receiver.duml import DumlFrameParser, ParsedFrame, build_test_frame, crc16, crc8
+from rc2_telemetry_receiver.duml import (
+    DumlFrameParser,
+    ParsedFrame,
+    WrappedDumlFrameParser,
+    build_test_frame,
+    crc16,
+    crc8,
+)
 from rc2_telemetry_receiver.pcap import iter_pcap_tcp_payloads
-from rc2_telemetry_receiver.receiver import RelayControlHub, SessionWriter, error_event, handle_payload_stream
+from rc2_telemetry_receiver.receiver import (
+    RelayControlHub,
+    SessionWriter,
+    error_event,
+    extract_serial_candidate,
+    handle_payload_stream,
+)
 from rc2_telemetry_receiver.telemetry import analyze_session, decode_candidate
 
 
@@ -34,6 +47,27 @@ class DumlParserTest(unittest.TestCase):
         frame = build_test_frame()
         self.assertEqual(frame[3], crc8(frame[:3]))
         self.assertEqual(frame[-2] | (frame[-1] << 8), crc16(frame[:-2]))
+
+    def test_wrapped_40007_frame_is_extracted(self) -> None:
+        frame = build_test_frame(sender=0xEE, receiver=0x82, cmd_set=0x51, cmd_id=0x14)
+        wrapped = b"\x55\xcc\x30\x75" + len(frame).to_bytes(4, "little") + frame
+        parser = WrappedDumlFrameParser()
+
+        self.assertEqual([], parser.feed(wrapped[:6]))
+        results = parser.feed(wrapped[6:])
+
+        self.assertEqual(1, len(results))
+        self.assertIsInstance(results[0], ParsedFrame)
+
+    def test_truncated_wrapped_frame_is_reported_at_end_of_stream(self) -> None:
+        frame = build_test_frame()
+        wrapped = b"\x55\xcc\x30\x75" + len(frame).to_bytes(4, "little") + frame
+        parser = WrappedDumlFrameParser()
+
+        self.assertEqual([], parser.feed(wrapped[:-2]))
+        results = parser.finish()
+
+        self.assertEqual("truncated_frame", results[0].reason)
 
 
 class SessionWriterTest(unittest.TestCase):
@@ -111,6 +145,37 @@ class SessionWriterTest(unittest.TestCase):
         self.assertEqual(2.5, candidate["gimbal"]["yaw_deg"])
         self.assertEqual("candidate", candidate["quality"]["gimbal"])
 
+    def test_aircraft_serial_is_only_extracted_from_valid_51_14_route(self) -> None:
+        payload = b"\x00WA150\x001581F6ABCDEF1234\x00FA1234567890ABCD\x00"
+        event = _frame_event(
+            cmd_set=0x51,
+            cmd_id=0x14,
+            payload=payload,
+            sender=0xEE,
+            receiver=0x82,
+        )
+
+        candidate = decode_candidate(event)
+
+        assert candidate is not None
+        self.assertEqual("1581F6ABCDEF1234", candidate["identity"]["aircraft_serial"])
+        self.assertEqual("FA1234567890ABCD", candidate["identity"]["serial_suffix"])
+        self.assertEqual("WA150", candidate["identity"]["model_code"])
+        self.assertEqual("candidate", candidate["quality"]["identity"])
+
+        wrong_family = {**event, "cmd_id": 0x13}
+        self.assertIsNone(decode_candidate(wrong_family))
+
+    def test_home_point_state_remains_candidate_and_position_null(self) -> None:
+        payload = bytearray(102)
+        struct.pack_into("<H", payload, 20, 0x47)
+
+        candidate = decode_candidate(_frame_event(cmd_set=0x03, cmd_id=0x44, payload=bytes(payload)))
+
+        assert candidate is not None
+        self.assertIsNone(candidate["position"]["lat_deg"])
+        self.assertTrue(candidate["raw"]["home_point_recorded_candidate"])
+
     def test_analyzer_does_not_classify_rc_channels_as_camera_pitch(self) -> None:
         rc_payload = b"\x00" + struct.pack("<8H", 256, 0, 1024, 1024, 1024, 1024, 1684, 1024)
         with tempfile.TemporaryDirectory() as tmp:
@@ -119,7 +184,7 @@ class SessionWriterTest(unittest.TestCase):
 
             report = analyze_session(session)
 
-            self.assertEqual(["03/43", "04/05"], report["missing_georeference_families"])
+            self.assertEqual(["03/43", "03/44", "04/05"], report["missing_georeference_families"])
             self.assertEqual({}, report["candidate_frames"])
             self.assertEqual(
                 "candidate_rc_channels_not_camera_attitude",
@@ -194,6 +259,13 @@ class RelayControlHubTest(unittest.TestCase):
         self.assertEqual("fc_osd_03_43_once", received["probe"])
         self.assertEqual("ok", result["status"])
 
+    def test_serial_candidate_prefers_full_aircraft_serial(self) -> None:
+        payload = b"\x00WA123\x001581F6ABCDEF1234\x00"
+        self.assertEqual("1581F6ABCDEF1234", extract_serial_candidate(payload))
+
+    def test_missing_serial_candidate_stays_unknown(self) -> None:
+        self.assertIsNone(extract_serial_candidate(b"\x00\x01\x02"))
+
     def test_general_duml_request_is_forwarded_without_shape_changes(self) -> None:
         app_side, mac_side = socket.socketpair()
         hub = RelayControlHub()
@@ -259,16 +331,32 @@ def _tcp_packet(src_port: int, dst_port: int, payload: bytes) -> bytes:
     return bytes(header) + payload
 
 
-def _frame_event(*, cmd_set: int, cmd_id: int, payload: bytes) -> dict[str, object]:
-    frame = build_test_frame(cmd_set=cmd_set, cmd_id=cmd_id, payload=payload)
+def _frame_event(
+    *,
+    cmd_set: int,
+    cmd_id: int,
+    payload: bytes,
+    sender: int = 0x03,
+    receiver: int = 0x43,
+) -> dict[str, object]:
+    frame = build_test_frame(
+        sender=sender,
+        receiver=receiver,
+        cmd_set=cmd_set,
+        cmd_id=cmd_id,
+        payload=payload,
+    )
     return {
         "type": "DUML_FRAME",
         "schema": "dji-rc2-telemetry/v1",
         "session_id": "candidate-session",
         "wall_time_utc": "2026-07-22T21:00:00.000Z",
         "source": "unit",
+        "sender": sender,
+        "receiver": receiver,
         "cmd_set": cmd_set,
         "cmd_id": cmd_id,
+        "validation_status": "valid",
         "raw_frame_b64": base64.b64encode(frame).decode("ascii"),
     }
 

@@ -54,6 +54,7 @@ data class AppState(
     // Telemetry research state
     val telemetryHost: String = "",
     val telemetryPort: String = "8765",
+    val telemetryCapturePort: String = "40007",
     val telemetrySourceId: String = "rc2-bench",
     val telemetryControllerFirmware: String = "",
     val telemetryDjiFlyVersion: String = "",
@@ -78,7 +79,7 @@ data class AppState(
 class FccViewModel(private val app: Application) : AndroidViewModel(app) {
 
     companion object {
-        const val APP_VERSION = "1.5.3-research.4"
+        const val APP_VERSION = "1.5.3-research.6"
 
         /**
          * Aircraft model codes known to support DJI Cellular Dongle 2 / 4G.
@@ -129,6 +130,9 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
             copy(
                 telemetryHost = prefs.getString("telemetry_host", "").orEmpty(),
                 telemetryPort = prefs.getString("telemetry_port", "8765").orEmpty().ifBlank { "8765" },
+                telemetryCapturePort = prefs.getString("telemetry_capture_port", "40007")
+                    .orEmpty()
+                    .ifBlank { "40007" },
                 telemetrySourceId = prefs.getString("telemetry_source_id", "rc2-bench").orEmpty().ifBlank { "rc2-bench" },
                 telemetryControllerFirmware = prefs.getString("telemetry_controller_firmware", "").orEmpty(),
                 telemetryDjiFlyVersion = prefs.getString("telemetry_dji_fly_version", "").orEmpty(),
@@ -174,6 +178,12 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
         update { copy(telemetryPort = cleaned) }
     }
 
+    fun updateTelemetryCapturePort(value: String) {
+        val cleaned = value.filter { it.isDigit() }.take(5)
+        prefs.edit().putString("telemetry_capture_port", cleaned).apply()
+        update { copy(telemetryCapturePort = cleaned) }
+    }
+
     fun updateTelemetrySourceId(value: String) {
         val cleaned = value.trim().ifBlank { "rc2-bench" }
         prefs.edit().putString("telemetry_source_id", cleaned).apply()
@@ -203,9 +213,14 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
     fun startTelemetryRelay() {
         val current = _state.value
         val port = current.telemetryPort.toIntOrNull()
-        if (current.telemetryHost.isBlank() || port == null || port !in 1..65535) {
-            update { copy(message = "Enter a valid Mac IP and port before telemetry relay starts.") }
-            log("Telemetry relay not started — invalid Mac host or port")
+        val capturePort = current.telemetryCapturePort.toIntOrNull()
+        if (
+            current.telemetryHost.isBlank() ||
+            port == null || port !in 1..65535 ||
+            capturePort == null || capturePort !in TelemetryRelayClient.RESEARCH_DUML_PORTS
+        ) {
+            update { copy(message = "Enter a valid Mac endpoint and supported DUML capture port.") }
+            log("Telemetry relay not started - invalid Mac endpoint or DUML capture port")
             return
         }
 
@@ -224,6 +239,7 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
             host = current.telemetryHost,
             port = port,
             sourceId = current.telemetrySourceId.ifBlank { "rc2-bench" },
+            capturePort = capturePort,
             controllerFirmware = current.telemetryControllerFirmware,
             djiFlyVersion = current.telemetryDjiFlyVersion,
             aircraftModel = current.telemetryAircraftModel,
@@ -244,34 +260,57 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
      * This intentionally has no retry loop; continuous polling remains disabled.
      */
     fun probeTelemetryFcOsd() {
+        if (
+            _state.value.telemetryRuntime.running &&
+            _state.value.telemetryRuntime.sourcePort == DumlTransport.PORT
+        ) {
+            update {
+                copy(
+                    telemetryProbeResult = null,
+                    telemetryProbeMessage = "Capture already holds port 40009. Use 40007 capture or stop the relay first."
+                )
+            }
+            log("Bench probe rejected - active capture holds DUML port 40009")
+            return
+        }
         if (!beginHardwareOp()) {
             log("Telemetry probe skipped - another hardware operation is running")
             return
         }
 
-        val relayConfig = telemetryConfigOrNull(_state.value)
-        val relayWasRunning = _state.value.telemetryRuntime.running
         update {
             copy(
                 telemetryProbeBusy = true,
                 telemetryProbeResult = null,
-                telemetryProbeMessage = "Pausing relay for one 03/43 request..."
+                telemetryProbeMessage = "Sending one 03/43 request on port 40009..."
             )
         }
-        log("Bench probe: preparing one read-only 03/43 request")
+        log("Bench probe: preparing one read-only 03/43 request on pinned port 40009")
 
         runOnIO {
+            var portLease: DumlPortSessionLock.Lease? = null
             try {
-                if (relayWasRunning) {
-                    TelemetryCaptureService.stop(app)
-                    TelemetryStatusBus.reset()
-                    delay(600)
+                portLease = DumlPortSessionLock.tryBegin(DumlTransport.PORT)
+                if (portLease == null) {
+                    update {
+                        copy(
+                            telemetryProbeResult = null,
+                            telemetryProbeMessage = "Port 40009 is busy; no request was sent."
+                        )
+                    }
+                    log("Bench probe skipped - DUML port 40009 is busy")
+                    return@runOnIO
                 }
 
                 val profile = Profiles.load(app, "telemetry_fc_osd_probe.json")
                 val frame = profile.frames.singleOrNull()
                     ?: error("Probe profile must contain exactly one frame")
-                val response = transport.sendAndReceive(frame, profile.readWindowMs, profile.port)
+                val response = transport.sendAndReceiveDetailed(
+                    frame,
+                    profile.readWindowMs,
+                    profile.port,
+                    pinPort = true
+                ).payload
 
                 if (response == null) {
                     update {
@@ -310,29 +349,11 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
                 }
                 log("Bench probe error: ${e.message.orEmpty()}")
             } finally {
+                portLease?.close()
                 endHardwareOp()
-                if (relayWasRunning && relayConfig != null) {
-                    delay(400)
-                    TelemetryCaptureService.start(app, relayConfig)
-                    log("Telemetry relay restarting after bench probe")
-                }
                 update { copy(telemetryProbeBusy = false) }
             }
         }
-    }
-
-    private fun telemetryConfigOrNull(current: AppState): TelemetryConfig? {
-        val port = current.telemetryPort.toIntOrNull()
-        if (current.telemetryHost.isBlank() || port == null || port !in 1..65535) return null
-        return TelemetryConfig(
-            host = current.telemetryHost,
-            port = port,
-            sourceId = current.telemetrySourceId.ifBlank { "rc2-bench" },
-            controllerFirmware = current.telemetryControllerFirmware,
-            djiFlyVersion = current.telemetryDjiFlyVersion,
-            aircraftModel = current.telemetryAircraftModel,
-            aircraftFirmware = current.telemetryAircraftFirmware
-        )
     }
 
     // --- Auto-FCC ---

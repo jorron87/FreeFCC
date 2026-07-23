@@ -10,14 +10,21 @@ import java.util.UUID
 import java.util.zip.CRC32
 
 enum class TelemetrySourceMode(val wireName: String) {
-    BenchActiveSocket("bench_active_socket")
+    BenchWrappedSocket("bench_wrapped_socket"),
+    BenchDirectSocket("bench_direct_socket");
+
+    companion object {
+        fun forPort(port: Int): TelemetrySourceMode =
+            if (port == DumlTransport.PORT_LED) BenchWrappedSocket else BenchDirectSocket
+    }
 }
 
 data class TelemetryConfig(
     val host: String,
     val port: Int,
     val sourceId: String,
-    val sourceMode: TelemetrySourceMode = TelemetrySourceMode.BenchActiveSocket,
+    val capturePort: Int = DumlTransport.PORT_LED,
+    val sourceMode: TelemetrySourceMode = TelemetrySourceMode.forPort(capturePort),
     val controllerFirmware: String = "",
     val djiFlyVersion: String = "",
     val aircraftModel: String = "",
@@ -40,13 +47,14 @@ data class TelemetryHelloEvent(
         "session_id" to sessionId,
         "app_version" to appVersion,
         "source_mode" to config.sourceMode.wireName,
+        "source_port" to config.capturePort,
         "source_id" to config.sourceId,
         "controller_model" to controllerModel,
         "controller_firmware" to config.controllerFirmware,
         "dji_fly_version" to config.djiFlyVersion,
         "aircraft_model" to config.aircraftModel,
         "aircraft_firmware" to config.aircraftFirmware,
-        "device" to Build.DEVICE,
+        "device" to (Build.DEVICE ?: "unknown"),
         "created_at" to utcNow()
     )
 }
@@ -147,12 +155,13 @@ data class TelemetryProbeResultEvent(
     val status: String,
     val message: String,
     val payload: ByteArray? = null,
-    val result: TelemetryProbeResult? = null
+    val result: TelemetryProbeResult? = null,
+    val exchange: DumlExchangeResult? = null
 ) : TelemetryEvent("PROBE_RESULT") {
     override fun toJsonLine(): String {
         val quality = if (result != null && status == "ok") "candidate" else "unavailable"
         return """
-            {"type":"$type","schema":"$TELEMETRY_SCHEMA","session_id":"${esc(sessionId)}","request_id":"${esc(requestId)}","probe":"fc_osd_03_43_once","captured_at":"${utcNow()}","status":"${esc(status)}","message":"${esc(message)}","position":{"lat_deg":null,"lon_deg":null,"alt_m":null},"attitude":{"roll_deg":${numberOrNull(result?.rollCandidateDeg)},"pitch_deg":${numberOrNull(result?.pitchCandidateDeg)},"yaw_deg":${numberOrNull(result?.yawCandidateDeg)}},"gimbal":{"roll_deg":null,"pitch_deg":null,"yaw_deg":null},"quality":{"position":"unknown","attitude":"$quality","gimbal":"unknown"},"raw":{"message_family":"03/43","payload_b64":${nullable(payload?.let(::b64))},"longitude_raw_f64":${numberOrNull(result?.longitudeRaw)},"latitude_raw_f64":${numberOrNull(result?.latitudeRaw)},"longitude_if_radians_deg":${numberOrNull(result?.longitudeRadiansCandidateDeg)},"latitude_if_radians_deg":${numberOrNull(result?.latitudeRadiansCandidateDeg)},"relative_height_m_candidate":${numberOrNull(result?.relativeHeightCandidateM)}}}
+            {"type":"$type","schema":"$TELEMETRY_SCHEMA","session_id":"${esc(sessionId)}","request_id":"${esc(requestId)}","probe":"fc_osd_03_43_once","captured_at":"${utcNow()}","status":"${esc(status)}","message":"${esc(message)}","position":{"lat_deg":null,"lon_deg":null,"alt_m":null},"attitude":{"roll_deg":${numberOrNull(result?.rollCandidateDeg)},"pitch_deg":${numberOrNull(result?.pitchCandidateDeg)},"yaw_deg":${numberOrNull(result?.yawCandidateDeg)}},"gimbal":{"roll_deg":null,"pitch_deg":null,"yaw_deg":null},"quality":{"position":"unknown","attitude":"$quality","gimbal":"unknown"},"raw":{"message_family":"03/43","payload_b64":${nullable(payload?.let(::b64))},"longitude_raw_f64":${numberOrNull(result?.longitudeRaw)},"latitude_raw_f64":${numberOrNull(result?.latitudeRaw)},"longitude_if_radians_deg":${numberOrNull(result?.longitudeRadiansCandidateDeg)},"latitude_if_radians_deg":${numberOrNull(result?.latitudeRadiansCandidateDeg)},"relative_height_m_candidate":${numberOrNull(result?.relativeHeightCandidateM)}},"diagnostics":${exchangeDiagnostics(exchange)}}
         """.trimIndent()
     }
 }
@@ -163,10 +172,11 @@ data class TelemetryDumlResultEvent(
     val command: TelemetryRelayCommand.Duml,
     val status: String,
     val message: String,
-    val responsePayload: ByteArray? = null
+    val responsePayload: ByteArray? = null,
+    val exchange: DumlExchangeResult? = null
 ) : TelemetryEvent("DUML_RESULT") {
     override fun toJsonLine(): String = """
-        {"type":"$type","schema":"$TELEMETRY_SCHEMA","session_id":"${esc(sessionId)}","request_id":"${esc(requestId)}","captured_at":"${utcNow()}","status":"${esc(status)}","message":"${esc(message)}","request":{"sender":${command.sender},"destination":${command.destination},"cmd_type":${command.cmdType},"cmd_set":${command.cmdSet},"cmd_id":${command.cmdId},"payload_b64":"${b64(command.payload)}","expect_response":${command.expectResponse},"read_window_ms":${command.readWindowMs},"port":${command.port}},"response":{"payload_b64":${nullable(responsePayload?.let(::b64))},"payload_length":${responsePayload?.size ?: 0}}}
+        {"type":"$type","schema":"$TELEMETRY_SCHEMA","session_id":"${esc(sessionId)}","request_id":"${esc(requestId)}","captured_at":"${utcNow()}","status":"${esc(status)}","message":"${esc(message)}","request":{"sender":${command.sender},"destination":${command.destination},"cmd_type":${command.cmdType},"cmd_set":${command.cmdSet},"cmd_id":${command.cmdId},"payload_b64":"${b64(command.payload)}","expect_response":${command.expectResponse},"read_window_ms":${command.readWindowMs},"port":${command.port}},"response":{"payload_b64":${nullable(responsePayload?.let(::b64))},"payload_length":${responsePayload?.size ?: 0}},"diagnostics":${exchangeDiagnostics(exchange)}}
     """.trimIndent()
 }
 
@@ -202,6 +212,14 @@ private fun nullable(value: String?): String = value?.let { "\"${esc(it)}\"" } ?
 
 private fun numberOrNull(value: Double?): String =
     if (value != null && value.isFinite()) value.toString() else "null"
+
+private fun exchangeDiagnostics(exchange: DumlExchangeResult?): String {
+    if (exchange == null) return "null"
+    val observations = exchange.observations.joinToString(prefix = "[", postfix = "]") {
+        """{"validation":"${esc(it.validation)}","raw_frame_b64":"${b64(it.raw)}"}"""
+    }
+    return """{"terminal_reason":"${esc(exchange.terminalReason)}","observed_frame_count":${exchange.observations.size},"observed_frames":$observations}"""
+}
 
 private fun jsonObject(vararg fields: Pair<String, Any>): String =
     fields.joinToString(prefix = "{", postfix = "}") { (key, value) ->

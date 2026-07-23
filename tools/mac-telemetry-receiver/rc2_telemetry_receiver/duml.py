@@ -155,3 +155,102 @@ class DumlFrameParser:
             results.append(ParseError("buffer_overflow", self._consumed, f"dropped={drop}"))
 
         return results
+
+    def finish(self) -> list[ParsedFrame | ParseError]:
+        if not self._buffer:
+            return []
+        pending = len(self._buffer)
+        offset = self._consumed
+        self._buffer.clear()
+        self._consumed += pending
+        return [ParseError("truncated_frame", offset, f"pending={pending}")]
+
+
+class WrappedDumlFrameParser:
+    """Parses direct DUML and the 40007 55cc3075 + u32 length envelope."""
+
+    OUTER_MAGIC = b"\x55\xcc\x30\x75"
+    OUTER_HEADER_BYTES = 8
+    MAX_BUFFER_BYTES = 16 * 1024
+
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+        self._consumed = 0
+
+    def feed(self, chunk: bytes) -> list[ParsedFrame | ParseError]:
+        if not chunk:
+            return []
+        self._buffer.extend(chunk)
+        results: list[ParsedFrame | ParseError] = []
+
+        while self._buffer:
+            try:
+                marker = self._buffer.index(0x55)
+            except ValueError:
+                self._consumed += len(self._buffer)
+                self._buffer.clear()
+                break
+            if marker:
+                self._drop(marker)
+            if len(self._buffer) < 4:
+                break
+
+            if self._buffer.startswith(self.OUTER_MAGIC):
+                if len(self._buffer) < self.OUTER_HEADER_BYTES:
+                    break
+                inner_length = int.from_bytes(self._buffer[4:8], "little")
+                if not MIN_FRAME_BYTES <= inner_length <= MAX_FRAME_BYTES:
+                    results.append(ParseError("wrapped_invalid_length", self._consumed, f"inner_length={inner_length}"))
+                    self._drop(1)
+                    continue
+                outer_length = self.OUTER_HEADER_BYTES + inner_length
+                if len(self._buffer) < outer_length:
+                    break
+                inner = bytes(self._buffer[self.OUTER_HEADER_BYTES:outer_length])
+                results.append(self._validate_single(inner, wrapped=True))
+                self._drop(outer_length)
+                continue
+
+            if len(self._buffer) < MIN_FRAME_BYTES:
+                break
+            frame_length = self._buffer[1] | ((self._buffer[2] & 0x03) << 8)
+            if not MIN_FRAME_BYTES <= frame_length <= MAX_FRAME_BYTES:
+                results.append(ParseError("invalid_length", self._consumed, f"length={frame_length}"))
+                self._drop(1)
+                continue
+            if len(self._buffer) < frame_length:
+                break
+            result = self._validate_single(bytes(self._buffer[:frame_length]), wrapped=False)
+            results.append(result)
+            self._drop(frame_length if isinstance(result, ParsedFrame) else 1)
+
+        if len(self._buffer) > self.MAX_BUFFER_BYTES:
+            dropped = len(self._buffer) - self.MAX_BUFFER_BYTES
+            self._drop(dropped)
+            results.append(ParseError("buffer_overflow", self._consumed, f"dropped={dropped}"))
+        return results
+
+    def finish(self) -> list[ParsedFrame | ParseError]:
+        if not self._buffer:
+            return []
+        pending = len(self._buffer)
+        offset = self._consumed
+        self._buffer.clear()
+        self._consumed += pending
+        return [ParseError("truncated_frame", offset, f"pending={pending}")]
+
+    def _validate_single(self, raw: bytes, *, wrapped: bool) -> ParsedFrame | ParseError:
+        parsed = DumlFrameParser().feed(raw)
+        if len(parsed) == 1 and isinstance(parsed[0], ParsedFrame):
+            return parsed[0]
+        error = next((item for item in parsed if isinstance(item, ParseError)), None)
+        prefix = "wrapped_" if wrapped else ""
+        return ParseError(
+            prefix + (error.reason if error else "invalid_frame"),
+            self._consumed,
+            error.detail if error else "",
+        )
+
+    def _drop(self, count: int) -> None:
+        del self._buffer[:count]
+        self._consumed += count

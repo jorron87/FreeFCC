@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 import socket
 import sys
 import threading
@@ -13,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .duml import DumlFrameParser, ParseError, ParsedFrame
+from .duml import ParseError, ParsedFrame, WrappedDumlFrameParser
 from .telemetry import decode_candidate
 
 
@@ -118,6 +119,10 @@ class SessionStats:
     last_probe: dict[str, Any] = field(default_factory=dict)
     duml_results: int = 0
     last_duml: dict[str, Any] = field(default_factory=dict)
+    aircraft_identity: dict[str, Any] = field(
+        default_factory=lambda: {"aircraft_serial": None, "serial_suffix": None, "model_code": None}
+    )
+    identity_quality: str = "unknown"
 
 
 class SessionWriter:
@@ -201,6 +206,9 @@ class SessionWriter:
                 elif family == "04/05":
                     self.stats.gimbal = dict(event.get("gimbal", self.stats.gimbal))
                     self.stats.gimbal_quality = str(quality.get("gimbal", "candidate"))
+                elif family == "51/14":
+                    self.stats.aircraft_identity = dict(event.get("identity", self.stats.aircraft_identity))
+                    self.stats.identity_quality = str(quality.get("identity", "candidate"))
                 self.stats.raw_candidate = dict(event.get("raw", self.stats.raw_candidate))
         elif event_type == "PROBE_RESULT":
             self.stats.probe_results += 1
@@ -233,6 +241,8 @@ class SessionWriter:
             "last_probe": self.stats.last_probe,
             "duml_results": self.stats.duml_results,
             "last_duml": self.stats.last_duml,
+            "aircraft_identity": self.stats.aircraft_identity,
+            "identity_quality": self.stats.identity_quality,
             "bytes": self.stats.bytes,
             "last_error": self.stats.last_error,
             "command_pairs": dict(sorted(self.stats.command_pairs.items())),
@@ -261,6 +271,12 @@ class SessionWriter:
         self.stats.attitude_quality = "unknown"
         self.stats.gimbal_quality = "unknown"
         self.stats.raw_candidate = {"message_family": None}
+        self.stats.aircraft_identity = {
+            "aircraft_serial": None,
+            "serial_suffix": None,
+            "model_code": None,
+        }
+        self.stats.identity_quality = "unknown"
 
 
 class RelayControlHub:
@@ -393,13 +409,47 @@ def request_remote_probe(control_bind: str) -> dict[str, Any]:
 def request_remote_duml(control_bind: str, command: dict[str, Any]) -> dict[str, Any]:
     return send_control_request(control_bind, {"type": "DUML_REQUEST", **command})
 
+def request_remote_aircraft_serial(control_bind: str) -> dict[str, Any]:
+    result = request_remote_duml(
+        control_bind,
+        {
+            "sender": 0x82,
+            "destination": 0x03,
+            "cmd_type": 0x40,
+            "cmd_set": 0x00,
+            "cmd_id": 0x51,
+            "payload_b64": "",
+            "expect_response": True,
+            "read_window_ms": 2000,
+            "port": 40009,
+        },
+    )
+    payload_b64 = result.get("response", {}).get("payload_b64")
+    payload = base64.b64decode(payload_b64) if payload_b64 else b""
+    result["serial_candidate"] = extract_serial_candidate(payload)
+    result["serial_quality"] = "candidate" if result["serial_candidate"] else "unknown"
+    return result
+
+
+def extract_serial_candidate(payload: bytes) -> str | None:
+    candidates = [
+        match.group().decode("ascii")
+        for match in re.finditer(rb"[A-Z0-9]{6,32}", payload.upper())
+    ]
+    if not candidates:
+        return None
+    return next((value for value in candidates if value.startswith("1581")), max(candidates, key=len))
+
 
 def send_control_request(control_bind: str, request: dict[str, Any]) -> dict[str, Any]:
     host, port_text = control_bind.rsplit(":", 1)
     with socket.create_connection((host, int(port_text)), timeout=8.0) as conn:
         conn.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
         with conn.makefile("r", encoding="utf-8", newline="\n") as reader:
-            return json.loads(reader.readline())
+            line = reader.readline()
+            if not line:
+                return {"status": "disconnected", "message": "Control socket closed without a response"}
+            return json.loads(line)
 
 
 def handle_payload_stream(*, payloads: Iterable[bytes], out_root: Path, session_id: str, source: str) -> SessionWriter:
@@ -416,7 +466,7 @@ def handle_payload_stream(*, payloads: Iterable[bytes], out_root: Path, session_
             "created_at": utc_now(),
         }
     )
-    parser = DumlFrameParser()
+    parser = WrappedDumlFrameParser()
     for seq, payload in enumerate(payloads, start=1):
         writer.handle_event(raw_chunk_event(session_id=session_id, seq=seq, source=source, direction="pcap_payload", port=40009, data=payload))
         for result in parser.feed(payload):
@@ -425,6 +475,9 @@ def handle_payload_stream(*, payloads: Iterable[bytes], out_root: Path, session_
             elif isinstance(result, ParseError):
                 writer.handle_event(error_event(session_id=session_id, reason=result.reason, detail=result.detail))
         _print_status(writer.stats)
+    for result in parser.finish():
+        if isinstance(result, ParseError):
+            writer.handle_event(error_event(session_id=session_id, reason=result.reason, detail=result.detail))
     return writer
 
 

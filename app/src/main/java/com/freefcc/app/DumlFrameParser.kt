@@ -115,6 +115,23 @@ class DumlFrameParser {
         consumedBytes = 0L
     }
 
+    fun finish(): List<Result> {
+        if (buffer.isEmpty()) return emptyList()
+        val pending = buffer.size
+        val offset = consumedBytes
+        buffer.clear()
+        consumedBytes += pending
+        return listOf(
+            Result.Error(
+                ParseError(
+                    reason = "truncated_frame",
+                    byteOffset = offset,
+                    detail = "pending=$pending"
+                )
+            )
+        )
+    }
+
     companion object {
         private const val MAGIC: Byte = 0x55
         const val MIN_FRAME_BYTES = 13

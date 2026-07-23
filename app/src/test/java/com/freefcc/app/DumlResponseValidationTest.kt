@@ -90,6 +90,10 @@ class DumlResponseValidationTest {
             payload = byteArrayOf(9, 8, 7, 6)
         )
         assertNull(DumlBuilder.validateResponse(request, response))
+        org.junit.Assert.assertEquals(
+            "sequence_mismatch",
+            DumlBuilder.inspectResponse(request, response).status
+        )
     }
 
     @Test
@@ -131,5 +135,9 @@ class DumlResponseValidationTest {
             payload = payload
         )
         assertArrayEquals(payload, DumlBuilder.validateResponse(request, response))
+        org.junit.Assert.assertEquals(
+            "matched",
+            DumlBuilder.inspectResponse(request, response).status
+        )
     }
 }

@@ -79,4 +79,18 @@ class DumlFrameParserTest {
 
         assertTrue(results.any { it is DumlFrameParser.Result.Error && it.error.reason == "invalid_length" })
     }
+
+    @Test
+    fun `truncated frame is reported when stream finishes`() {
+        val parser = DumlFrameParser()
+        val frame = buildRawFrame()
+
+        assertTrue(parser.feed(frame.copyOf(frame.size - 2)).isEmpty())
+        val results = parser.finish()
+
+        assertTrue(
+            results.single() is DumlFrameParser.Result.Error &&
+                (results.single() as DumlFrameParser.Result.Error).error.reason == "truncated_frame"
+        )
+    }
 }

@@ -180,9 +180,41 @@ Each command is a small binary packet with a magic byte (`0x55`), a header with 
 
 This fork adds a separate Telemetry tab for raw metadata research. It can stream `RAW_CHUNK` and validated `DUML_FRAME` NDJSON records to a local Mac on port `8765`.
 
-The Android source mode is marked `bench_active_socket`: it opens `127.0.0.1:40009` and reads without writing unless a bench probe is explicitly requested. Treat it as motors-off, propellers-removed bench work only. A local socket EOF is recorded as a `capture_gap`, all georeference fields become `unavailable`, and the source reconnects with bounded backoff and a fresh parser. If DJI Fly reconnects, the control link changes, or the relay queue backs up, stop the test.
+`1.5.3-research.6` defaults to `bench_wrapped_socket` on `127.0.0.1:40007`.
+The parser accepts both direct DUML and the observed
+`55 cc 30 75 + u32 little-endian length + inner DUML` envelope. Inner frames
+are emitted only after encoded-length, CRC-8 and CRC-16 validation. The
+Telemetry tab can instead select direct `40009` or the known alternate ports
+`8901`-`8904`.
 
-The receiver also exposes a Mac-local control socket on `127.0.0.1:8766`. It can request the predefined one-shot `03/43` candidate decoder or send one structured DUML frame. Commands are correlated by `request_id`, recorded as `PROBE_RESULT` or `DUML_RESULT`, limited to a 512-byte payload and a bounded response window, and never retried automatically.
+Treat every Android source as motors-off, propellers-removed bench work only.
+Each explicit start opens exactly one read-only capture connection. A socket
+EOF or I/O failure is recorded as a `capture_gap`, clears current metadata and
+requires an explicit restart; the app does not reconnect the DUML source
+automatically. If DJI Fly reconnects or the control link changes, stop the test.
+
+The receiver also exposes a Mac-local control socket on `127.0.0.1:8766`. It
+can request the predefined one-shot `03/43` candidate decoder or send one
+structured DUML frame with caller-selected sender, destination, command type,
+command set, command ID, payload, response window and localhost port. Commands
+are correlated by `request_id`, recorded as `PROBE_RESULT` or `DUML_RESULT`,
+limited to a 512-byte payload and the known ports above, and never retried
+automatically. The selected command port is pinned and never replaced by port
+auto-detection. A command targeting the active capture port is rejected; a
+command on another port can run without tearing down capture.
+
+Physical bench status from 2026-07-22/23: the relay streamed over LAN while DJI Fly remained connected on the tested RC2, and the final `research.3` session recorded 11,512 validated frames with no parser errors or capture gaps. The dominant passive family was `06/AE`; channel 6 correlated with the gimbal pitch wheel and is treated as controller input, not absolute gimbal pitch. No passive `03/43` or `04/05` frames were observed, including after GPS fix and home-point update.
+
+Four one-shot probes from `research.3` reported `no_response`. Review of
+`dji-firmware-tools` then showed that valid DJI replies may omit the RESPONSE
+bit. `research.4` accepted such replies only when CRC, sequence, reverse routing
+and command set/ID still matched, but physical `03/43` and `00/51` tests still
+returned no matched response. `research.5` added bounded raw response
+diagnostics. The preferred `research.6` path is now passive `40007`: observed
+families `03/43`, `03/44`, `04/05` and `51/14` are retained as candidates.
+Aircraft identity is extracted only from a CRC-valid `51/14` frame on the
+observed `0xEE -> App` route. GPS coordinates remain null until a controlled
+Neo 2 correlation verifies offsets, types and scale.
 
 For the preferred passive path, use the Mac companion:
 
@@ -192,6 +224,9 @@ python -m rc2_telemetry_receiver --adb-pcap --out /Users/jorgen/Documents/RC/cap
 ```
 
 The receiver preserves raw bytes and keeps latitude/longitude unknown until a version-scoped field mapping has been verified.
+
+Current published research build: `1.5.3-research.6`. It remains bench-only
+until its physical RC2 gate has passed.
 
 ### Research Update Channel
 

@@ -14,9 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.IOException
@@ -58,8 +56,15 @@ class TelemetryCaptureService : Service() {
 
         val host = intent.getStringExtra(EXTRA_HOST).orEmpty()
         val port = intent.getIntExtra(EXTRA_PORT, DEFAULT_RELAY_PORT)
-        if (host.isBlank() || port !in 1..65535) {
-            TelemetryStatusBus.update(TelemetryStatus(running = false, lastError = "Invalid Mac host or port"))
+        val capturePort = intent.getIntExtra(EXTRA_CAPTURE_PORT, DumlTransport.PORT_LED)
+        if (
+            host.isBlank() ||
+            port !in 1..65535 ||
+            capturePort !in TelemetryRelayClient.RESEARCH_DUML_PORTS
+        ) {
+            TelemetryStatusBus.update(
+                TelemetryStatus(running = false, lastError = "Invalid Mac endpoint or DUML capture port")
+            )
             stopSelf()
             return
         }
@@ -68,6 +73,7 @@ class TelemetryCaptureService : Service() {
             host = host,
             port = port,
             sourceId = intent.getStringExtra(EXTRA_SOURCE_ID).orEmpty().ifBlank { "rc2-bench" },
+            capturePort = capturePort,
             controllerFirmware = intent.getStringExtra(EXTRA_CONTROLLER_FIRMWARE).orEmpty(),
             djiFlyVersion = intent.getStringExtra(EXTRA_DJI_FLY_VERSION).orEmpty(),
             aircraftModel = intent.getStringExtra(EXTRA_AIRCRAFT_MODEL).orEmpty(),
@@ -90,6 +96,8 @@ class TelemetryCaptureService : Service() {
                 relayConnected = false,
                 sessionId = sessionId,
                 sourceMode = config.sourceMode.wireName,
+                sourcePort = config.capturePort,
+                captureActive = false,
                 rawChunks = 0,
                 frames = 0,
                 parserErrors = 0,
@@ -123,8 +131,7 @@ class TelemetryCaptureService : Service() {
 
         scope.launch {
             var hardwareLockHeld = false
-            var capturePaused = false
-            val config = activeConfig
+            var portLease: DumlPortSessionLock.Lease? = null
             try {
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastCommandStartedElapsedMs < MIN_COMMAND_INTERVAL_MS) {
@@ -139,33 +146,24 @@ class TelemetryCaptureService : Service() {
                 }
                 hardwareLockHeld = true
 
-                if (config == null) {
+                if (activeConfig == null) {
                     sendRelayFailure(command, "error", "Telemetry session configuration is unavailable")
                     return@launch
                 }
 
-                val oldCaptureJob = captureJob
-                captureJob = null
-                try { captureSocket?.close() } catch (_: Exception) {}
-                captureSocket = null
-                oldCaptureJob?.cancelAndJoin()
-                capturePaused = true
-
-                relay?.enqueue(
-                    TelemetryUnavailableEvent(
-                        sessionId = sessionId,
-                        sourceId = config.sourceId,
-                        reason = "active remote DUML request"
+                val commandPort = when (command) {
+                    is TelemetryRelayCommand.Probe -> DumlTransport.PORT
+                    is TelemetryRelayCommand.Duml -> command.port
+                }
+                portLease = DumlPortSessionLock.tryBegin(commandPort)
+                if (portLease == null) {
+                    sendRelayFailure(
+                        command,
+                        "port_busy",
+                        "DUML port $commandPort is held by active capture or another command"
                     )
-                )
-                TelemetryStatusBus.update(
-                    TelemetryStatus(
-                        running = true,
-                        connecting = true,
-                        lastError = "Metadata unavailable during one-shot DUML request"
-                    )
-                )
-                delay(PROBE_SOCKET_SETTLE_MS)
+                    return@launch
+                }
 
                 when (command) {
                     is TelemetryRelayCommand.Probe -> executeFcOsdProbe(command)
@@ -174,11 +172,8 @@ class TelemetryCaptureService : Service() {
             } catch (e: Exception) {
                 sendRelayFailure(command, "error", e.message.orEmpty().ifBlank { "DUML request failed" })
             } finally {
+                portLease?.close()
                 if (hardwareLockHeld) HardwareLock.end()
-                if (capturePaused && config != null && scope.coroutineContext.isActive) {
-                    delay(PROBE_RESTART_DELAY_MS)
-                    captureJob = scope.launch { runBenchSocketCapture(config) }
-                }
                 commandInFlight.set(false)
             }
         }
@@ -188,9 +183,20 @@ class TelemetryCaptureService : Service() {
         val profile = Profiles.load(this, "telemetry_fc_osd_probe.json")
         val frame = profile.frames.singleOrNull()
             ?: error("Probe profile must contain exactly one frame")
-        val payload = probeTransport.sendAndReceive(frame, profile.readWindowMs, profile.port)
+        val exchange = probeTransport.sendAndReceiveDetailed(
+            frame,
+            profile.readWindowMs,
+            profile.port,
+            pinPort = true
+        )
+        val payload = exchange.payload
         if (payload == null) {
-            sendProbeResult(command.requestId, "no_response", "No matching 03/43 response; no retry sent")
+            sendProbeResult(
+                command.requestId,
+                "no_response",
+                "No matching 03/43 response; no retry sent",
+                exchange = exchange
+            )
             return
         }
 
@@ -200,7 +206,8 @@ class TelemetryCaptureService : Service() {
                 command.requestId,
                 "layout_mismatch",
                 "03/43 payload was ${payload.size} bytes; expected at least 30",
-                payload
+                payload,
+                exchange = exchange
             )
         } else {
             sendProbeResult(
@@ -208,7 +215,8 @@ class TelemetryCaptureService : Service() {
                 "ok",
                 "Candidate data received; GPS remains unverified",
                 payload,
-                decoded
+                decoded,
+                exchange
             )
         }
     }
@@ -225,12 +233,19 @@ class TelemetryCaptureService : Service() {
             )
         )
         if (command.expectResponse) {
-            val response = probeTransport.sendAndReceive(frame, command.readWindowMs, command.port)
+            val exchange = probeTransport.sendAndReceiveDetailed(
+                frame,
+                command.readWindowMs,
+                command.port,
+                pinPort = true
+            )
+            val response = exchange.payload
             sendDumlResult(
                 command = command,
                 status = if (response == null) "no_response" else "ok",
                 message = if (response == null) "No matching response; no retry sent" else "Matching response received",
-                responsePayload = response
+                responsePayload = response,
+                exchange = exchange
             )
         } else {
             val sent = probeTransport.sendFrames(
@@ -239,7 +254,8 @@ class TelemetryCaptureService : Service() {
                 interFrameDelayMs = 0,
                 interRoundDelayMs = 0,
                 readWindowMs = command.readWindowMs,
-                port = command.port
+                port = command.port,
+                pinPort = true
             )
             sendDumlResult(
                 command = command,
@@ -254,7 +270,8 @@ class TelemetryCaptureService : Service() {
         status: String,
         message: String,
         payload: ByteArray? = null,
-        result: TelemetryProbeResult? = null
+        result: TelemetryProbeResult? = null,
+        exchange: DumlExchangeResult? = null
     ) {
         relay?.enqueue(
             TelemetryProbeResultEvent(
@@ -263,7 +280,8 @@ class TelemetryCaptureService : Service() {
                 status = status,
                 message = message,
                 payload = payload,
-                result = result
+                result = result,
+                exchange = exchange
             )
         )
     }
@@ -272,7 +290,8 @@ class TelemetryCaptureService : Service() {
         command: TelemetryRelayCommand.Duml,
         status: String,
         message: String,
-        responsePayload: ByteArray? = null
+        responsePayload: ByteArray? = null,
+        exchange: DumlExchangeResult? = null
     ) {
         relay?.enqueue(
             TelemetryDumlResultEvent(
@@ -281,7 +300,8 @@ class TelemetryCaptureService : Service() {
                 command = command,
                 status = status,
                 message = message,
-                responsePayload = responsePayload
+                responsePayload = responsePayload,
+                exchange = exchange
             )
         )
     }
@@ -295,128 +315,157 @@ class TelemetryCaptureService : Service() {
 
     private suspend fun runBenchSocketCapture(config: TelemetryConfig) {
         val buffer = ByteArray(4096)
-        var reconnectDelayMs = BENCH_RECONNECT_INITIAL_MS
+        val parser = WrappedDumlFrameParser()
+        val sourcePort = config.capturePort
+        val lease = DumlPortSessionLock.tryBegin(sourcePort)
+        if (lease == null) {
+            reportCaptureGap(config, "DUML port $sourcePort is already in use")
+            return
+        }
+        val socket = Socket()
+        captureSocket = socket
+        var gapReason = "Bench socket closed"
+        try {
+            socket.connect(InetSocketAddress(DUML_HOST, sourcePort), DUML_CONNECT_TIMEOUT_MS)
+            socket.tcpNoDelay = true
+            socket.soTimeout = 500
+            TelemetryStatusBus.update(
+                TelemetryStatus(
+                    connecting = false,
+                    captureActive = true,
+                    sourcePort = sourcePort,
+                    lastError = ""
+                )
+            )
 
-        while (currentCoroutineContext().isActive) {
-            val parser = DumlFrameParser()
-            val socket = Socket()
-            captureSocket = socket
-            var receivedData = false
-            var gapReason = "Bench socket closed"
-            try {
-                socket.connect(InetSocketAddress(DUML_HOST, DUML_PORT), DUML_CONNECT_TIMEOUT_MS)
-                socket.tcpNoDelay = true
-                socket.soTimeout = 500
-                TelemetryStatusBus.update(TelemetryStatus(connecting = false, lastError = ""))
+            val input = socket.getInputStream()
+            while (currentCoroutineContext().isActive && !socket.isClosed) {
+                val n = try {
+                    input.read(buffer)
+                } catch (_: java.net.SocketTimeoutException) {
+                    continue
+                }
+                if (n <= 0) break
+                val bytes = buffer.copyOf(n)
+                val seq = ++rawSeq
+                rawChunks += 1
+                byteCount += bytes.size
 
-                val input = socket.getInputStream()
-                while (currentCoroutineContext().isActive && !socket.isClosed) {
-                    val n = try {
-                        input.read(buffer)
-                    } catch (_: java.net.SocketTimeoutException) {
-                        continue
-                    }
-                    if (n <= 0) break
-                    receivedData = true
-                    val bytes = buffer.copyOf(n)
-                    val seq = ++rawSeq
-                    rawChunks += 1
-                    byteCount += bytes.size
+                relay?.enqueue(
+                    RawChunkEvent(
+                        sessionId = sessionId,
+                        seq = seq,
+                        elapsedRealtimeNs = SystemClock.elapsedRealtimeNanos(),
+                        source = config.sourceMode.wireName,
+                        direction = "controller_to_client",
+                        port = sourcePort,
+                        bytes = bytes
+                    )
+                ) ?: break
 
-                    relay?.enqueue(
-                        RawChunkEvent(
-                            sessionId = sessionId,
-                            seq = seq,
-                            elapsedRealtimeNs = SystemClock.elapsedRealtimeNanos(),
-                            source = config.sourceMode.wireName,
-                            direction = "controller_to_client",
-                            port = DUML_PORT,
-                            bytes = bytes
-                        )
-                    ) ?: break
-
-                    for (result in parser.feed(bytes)) {
-                        when (result) {
-                            is DumlFrameParser.Result.Frame -> {
-                                frameCount += 1
-                                relay?.enqueue(
-                                    DumlFrameEvent(
-                                        sessionId = sessionId,
-                                        rawSeq = seq,
-                                        frame = result.frame,
-                                        source = config.sourceMode.wireName,
-                                        direction = "controller_to_client",
-                                        port = DUML_PORT
-                                    )
+                for (result in parser.feed(bytes)) {
+                    when (result) {
+                        is DumlFrameParser.Result.Frame -> {
+                            frameCount += 1
+                            relay?.enqueue(
+                                DumlFrameEvent(
+                                    sessionId = sessionId,
+                                    rawSeq = seq,
+                                    frame = result.frame,
+                                    source = config.sourceMode.wireName,
+                                    direction = "controller_to_client",
+                                    port = sourcePort
                                 )
-                            }
-                            is DumlFrameParser.Result.Error -> {
-                                parserErrors += 1
-                                relay?.enqueue(
-                                    TelemetryErrorEvent(
-                                        sessionId = sessionId,
-                                        reason = result.error.reason,
-                                        detail = result.error.detail
-                                    )
+                            )
+                        }
+                        is DumlFrameParser.Result.Error -> {
+                            parserErrors += 1
+                            relay?.enqueue(
+                                TelemetryErrorEvent(
+                                    sessionId = sessionId,
+                                    reason = result.error.reason,
+                                    detail = result.error.detail
                                 )
-                            }
+                            )
                         }
                     }
+                }
 
-                    TelemetryStatusBus.update(
-                        TelemetryStatus(
-                            running = true,
-                            rawChunks = rawChunks,
-                            frames = frameCount,
-                            parserErrors = parserErrors,
-                            bytes = byteCount
+                TelemetryStatusBus.update(
+                    TelemetryStatus(
+                        running = true,
+                        captureActive = true,
+                        rawChunks = rawChunks,
+                        frames = frameCount,
+                        parserErrors = parserErrors,
+                        bytes = byteCount
+                    )
+                )
+            }
+            for (result in parser.finish()) {
+                if (result is DumlFrameParser.Result.Error) {
+                    parserErrors += 1
+                    relay?.enqueue(
+                        TelemetryErrorEvent(
+                            sessionId = sessionId,
+                            reason = result.error.reason,
+                            detail = result.error.detail
                         )
                     )
                 }
-            } catch (e: IOException) {
-                gapReason = "Bench socket failed: ${e.message.orEmpty()}"
-            } catch (e: Exception) {
-                if (currentCoroutineContext().isActive) {
-                    failClosed("Telemetry capture failed: ${e.message.orEmpty()}")
-                }
-                return
-            } finally {
-                try { socket.close() } catch (_: Exception) {}
-                if (captureSocket === socket) captureSocket = null
             }
-
-            if (!currentCoroutineContext().isActive) return
-
-            relay?.enqueue(
-                TelemetryErrorEvent(
-                    sessionId = sessionId,
-                    reason = "capture_gap",
-                    detail = "$gapReason; reconnecting"
-                )
-            )
-            relay?.enqueue(
-                TelemetryUnavailableEvent(
-                    sessionId = sessionId,
-                    sourceId = config.sourceId,
-                    reason = gapReason
-                )
-            )
-            TelemetryStatusBus.update(
-                TelemetryStatus(
-                    running = true,
-                    connecting = true,
-                    lastError = "$gapReason; metadata unavailable while reconnecting"
-                )
-            )
-
-            if (receivedData) reconnectDelayMs = BENCH_RECONNECT_INITIAL_MS
-            delay(reconnectDelayMs)
-            reconnectDelayMs = (reconnectDelayMs * 2).coerceAtMost(BENCH_RECONNECT_MAX_MS)
+        } catch (e: IOException) {
+            gapReason = "Bench socket failed: ${e.message.orEmpty()}"
+        } catch (e: Exception) {
+            if (currentCoroutineContext().isActive) {
+                failClosed("Telemetry capture failed: ${e.message.orEmpty()}")
+            }
+            return
+        } finally {
+            try { socket.close() } catch (_: Exception) {}
+            if (captureSocket === socket) captureSocket = null
+            lease.close()
         }
+
+        if (!currentCoroutineContext().isActive) return
+        reportCaptureGap(config, gapReason)
+    }
+
+    private fun reportCaptureGap(config: TelemetryConfig, reason: String) {
+        relay?.enqueue(
+            TelemetryErrorEvent(
+                sessionId = sessionId,
+                reason = "capture_gap",
+                detail = "$reason; explicit restart required"
+            )
+        )
+        relay?.enqueue(
+            TelemetryUnavailableEvent(
+                sessionId = sessionId,
+                sourceId = config.sourceId,
+                reason = reason
+            )
+        )
+        TelemetryStatusBus.update(
+            TelemetryStatus(
+                running = true,
+                connecting = false,
+                captureActive = false,
+                lastError = "$reason; metadata unavailable, restart relay explicitly"
+            )
+        )
     }
 
     private fun failClosed(reason: String) {
-        TelemetryStatusBus.update(TelemetryStatus(running = false, relayConnected = false, connecting = false, lastError = reason))
+        TelemetryStatusBus.update(
+            TelemetryStatus(
+                running = false,
+                relayConnected = false,
+                connecting = false,
+                captureActive = false,
+                lastError = reason
+            )
+        )
         stopCapture()
     }
 
@@ -428,7 +477,15 @@ class TelemetryCaptureService : Service() {
         relay?.stop()
         relay = null
         activeConfig = null
-        TelemetryStatusBus.update(TelemetryStatus(running = false, connecting = false, relayConnected = false, queueDepth = 0))
+        TelemetryStatusBus.update(
+            TelemetryStatus(
+                running = false,
+                connecting = false,
+                relayConnected = false,
+                captureActive = false,
+                queueDepth = 0
+            )
+        )
         if (closeService) {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -474,13 +531,8 @@ class TelemetryCaptureService : Service() {
         private const val CHANNEL_ID = "telemetry_relay"
         private const val NOTIFICATION_ID = 9020
         private const val DUML_HOST = "127.0.0.1"
-        private const val DUML_PORT = 40009
         private const val DUML_CONNECT_TIMEOUT_MS = 2_000
-        private const val BENCH_RECONNECT_INITIAL_MS = 1_000L
-        private const val BENCH_RECONNECT_MAX_MS = 5_000L
         private const val MIN_COMMAND_INTERVAL_MS = 500L
-        private const val PROBE_SOCKET_SETTLE_MS = 200L
-        private const val PROBE_RESTART_DELAY_MS = 250L
         private const val DEFAULT_RELAY_PORT = 8765
 
         private const val ACTION_START = "com.freefcc.app.telemetry.START"
@@ -488,6 +540,7 @@ class TelemetryCaptureService : Service() {
         private const val EXTRA_HOST = "host"
         private const val EXTRA_PORT = "port"
         private const val EXTRA_SOURCE_ID = "source_id"
+        private const val EXTRA_CAPTURE_PORT = "capture_port"
         private const val EXTRA_CONTROLLER_FIRMWARE = "controller_firmware"
         private const val EXTRA_DJI_FLY_VERSION = "dji_fly_version"
         private const val EXTRA_AIRCRAFT_MODEL = "aircraft_model"
@@ -499,6 +552,7 @@ class TelemetryCaptureService : Service() {
                 putExtra(EXTRA_HOST, config.host)
                 putExtra(EXTRA_PORT, config.port)
                 putExtra(EXTRA_SOURCE_ID, config.sourceId)
+                putExtra(EXTRA_CAPTURE_PORT, config.capturePort)
                 putExtra(EXTRA_CONTROLLER_FIRMWARE, config.controllerFirmware)
                 putExtra(EXTRA_DJI_FLY_VERSION, config.djiFlyVersion)
                 putExtra(EXTRA_AIRCRAFT_MODEL, config.aircraftModel)
