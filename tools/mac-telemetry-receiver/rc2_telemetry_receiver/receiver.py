@@ -106,14 +106,19 @@ class SessionStats:
     capture_state: str = "unknown"
     command_pairs: dict[str, int] = field(default_factory=dict)
     candidate_events: int = 0
+    position: dict[str, float | None] = field(
+        default_factory=lambda: {"lat_deg": None, "lon_deg": None, "alt_m": None}
+    )
     attitude: dict[str, float | None] = field(
         default_factory=lambda: {"roll_deg": None, "pitch_deg": None, "yaw_deg": None}
     )
     gimbal: dict[str, float | None] = field(
         default_factory=lambda: {"roll_deg": None, "pitch_deg": None, "yaw_deg": None}
     )
+    position_quality: str = "unknown"
     attitude_quality: str = "unknown"
     gimbal_quality: str = "unknown"
+    altitude_quality: str = "unknown"
     raw_candidate: dict[str, Any] = field(default_factory=lambda: {"message_family": None})
     probe_results: int = 0
     last_probe: dict[str, Any] = field(default_factory=dict)
@@ -121,6 +126,9 @@ class SessionStats:
     last_duml: dict[str, Any] = field(default_factory=dict)
     aircraft_identity: dict[str, Any] = field(
         default_factory=lambda: {"aircraft_serial": None, "serial_suffix": None, "model_code": None}
+    )
+    controller_identity: dict[str, Any] = field(
+        default_factory=lambda: {"controller_serial": None, "serial_source": None}
     )
     identity_quality: str = "unknown"
 
@@ -172,7 +180,12 @@ class SessionWriter:
 
     def _update_stats(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
-        if event_type == "RAW_CHUNK":
+        if event_type == "HELLO":
+            self.stats.controller_identity = {
+                "controller_serial": event.get("controller_serial"),
+                "serial_source": event.get("controller_serial_source"),
+            }
+        elif event_type == "RAW_CHUNK":
             self.stats.raw_chunks += 1
             self.stats.bytes += len(base64.b64decode(str(event.get("bytes_b64", ""))))
             self.stats.capture_state = "active"
@@ -201,8 +214,15 @@ class SessionWriter:
                 self.stats.candidate_events += 1
                 family = str(event.get("raw", {}).get("message_family") or "")
                 if family == "03/43":
+                    self.stats.position = dict(event.get("position", self.stats.position))
                     self.stats.attitude = dict(event.get("attitude", self.stats.attitude))
+                    self.stats.position_quality = str(quality.get("position", "probable"))
                     self.stats.attitude_quality = str(quality.get("attitude", "candidate"))
+                    self.stats.altitude_quality = str(quality.get("altitude", "unknown"))
+                elif family == "03/57":
+                    self.stats.position = dict(event.get("position", self.stats.position))
+                    self.stats.position_quality = str(quality.get("position", "candidate"))
+                    self.stats.altitude_quality = str(quality.get("altitude", "candidate"))
                 elif family == "04/05":
                     self.stats.gimbal = dict(event.get("gimbal", self.stats.gimbal))
                     self.stats.gimbal_quality = str(quality.get("gimbal", "candidate"))
@@ -242,6 +262,7 @@ class SessionWriter:
             "duml_results": self.stats.duml_results,
             "last_duml": self.stats.last_duml,
             "aircraft_identity": self.stats.aircraft_identity,
+            "controller_identity": self.stats.controller_identity,
             "identity_quality": self.stats.identity_quality,
             "bytes": self.stats.bytes,
             "last_error": self.stats.last_error,
@@ -249,12 +270,18 @@ class SessionWriter:
             "georef": {
                 "source_id": self.session_id,
                 "captured_at": utc_now(),
-                "position": {"lat_deg": None, "lon_deg": None, "alt_m": None},
+                "position": self.stats.position,
                 "attitude": self.stats.attitude,
+                "heading": {
+                    "aircraft_deg": self.stats.attitude.get("yaw_deg"),
+                    "reference": "aircraft_yaw_reference_unknown",
+                },
                 "gimbal": self.stats.gimbal,
                 "quality": {
-                    "position": "unavailable" if self.stats.capture_state == "unavailable" else "unknown",
+                    "position": "unavailable" if self.stats.capture_state == "unavailable" else self.stats.position_quality,
                     "attitude": "unavailable" if self.stats.capture_state == "unavailable" else self.stats.attitude_quality,
+                    "heading": "unavailable" if self.stats.capture_state == "unavailable" else self.stats.attitude_quality,
+                    "altitude": "unavailable" if self.stats.capture_state == "unavailable" else self.stats.altitude_quality,
                     "gimbal": "unavailable" if self.stats.capture_state == "unavailable" else self.stats.gimbal_quality,
                 },
                 "raw": self.stats.raw_candidate,
@@ -266,10 +293,13 @@ class SessionWriter:
         temporary_path.replace(summary_path)
 
     def _clear_candidates(self) -> None:
+        self.stats.position = {"lat_deg": None, "lon_deg": None, "alt_m": None}
         self.stats.attitude = {"roll_deg": None, "pitch_deg": None, "yaw_deg": None}
         self.stats.gimbal = {"roll_deg": None, "pitch_deg": None, "yaw_deg": None}
+        self.stats.position_quality = "unknown"
         self.stats.attitude_quality = "unknown"
         self.stats.gimbal_quality = "unknown"
+        self.stats.altitude_quality = "unknown"
         self.stats.raw_candidate = {"message_family": None}
         self.stats.aircraft_identity = {
             "aircraft_serial": None,
@@ -357,24 +387,28 @@ def listen(bind: str, out_root: Path, control_bind: str = "127.0.0.1:8766") -> N
             conn, addr = server.accept()
             print(f"client connected from {addr[0]}:{addr[1]}", flush=True)
             control_hub.attach(conn)
-            with conn, conn.makefile("r", encoding="utf-8", newline="\n") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        event = error_event(session_id="invalid-json", reason="json_decode", detail=str(exc))
-                    session_id = str(event.get("session_id") or "unknown")
-                    writer = writers.get(session_id)
-                    if writer is None:
-                        writer = SessionWriter(out_root)
-                        writers[session_id] = writer
-                    writer.handle_event(event)
-                    control_hub.handle_event(event)
-                    _print_status(writer.stats)
-            control_hub.detach(conn)
+            try:
+                with conn, conn.makefile("r", encoding="utf-8", newline="\n") as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError as exc:
+                            event = error_event(session_id="invalid-json", reason="json_decode", detail=str(exc))
+                        session_id = str(event.get("session_id") or "unknown")
+                        writer = writers.get(session_id)
+                        if writer is None:
+                            writer = SessionWriter(out_root)
+                            writers[session_id] = writer
+                        writer.handle_event(event)
+                        control_hub.handle_event(event)
+                        _print_status(writer.stats)
+            except OSError as exc:
+                print(f"client socket closed: {exc}", flush=True)
+            finally:
+                control_hub.detach(conn)
             print("client disconnected", flush=True)
 
 
@@ -404,6 +438,27 @@ def _serve_control(bind: str, hub: RelayControlHub) -> None:
 
 def request_remote_probe(control_bind: str) -> dict[str, Any]:
     return send_control_request(control_bind, {"probe": "fc_osd_03_43_once"})
+
+
+def request_remote_gps_hmsl(control_bind: str, port: int = 40009) -> dict[str, Any]:
+    result = request_remote_duml(
+        control_bind,
+        {
+            "sender": 0x82,
+            "destination": 0x03,
+            "cmd_type": 0x40,
+            "cmd_set": 0x03,
+            "cmd_id": 0x57,
+            "payload_b64": "",
+            "expect_response": True,
+            "read_window_ms": 1500,
+            "port": port,
+        },
+    )
+    candidate = decode_candidate(result)
+    if candidate is not None:
+        result["telemetry_candidate"] = candidate
+    return result
 
 
 def request_remote_duml(control_bind: str, command: dict[str, Any]) -> dict[str, Any]:

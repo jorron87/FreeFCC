@@ -118,7 +118,7 @@ class SessionWriterTest(unittest.TestCase):
             self.assertEqual("unavailable", summary["capture_state"])
             self.assertEqual("unavailable", summary["georef"]["quality"]["position"])
 
-    def test_fc_osd_candidate_keeps_position_null(self) -> None:
+    def test_fc_osd_candidate_exposes_operator_correlated_position_and_heading(self) -> None:
         payload = bytearray(48)
         struct.pack_into("<dd", payload, 0, 0.185, 1.047)
         struct.pack_into("<h", payload, 16, 123)
@@ -128,12 +128,52 @@ class SessionWriterTest(unittest.TestCase):
         candidate = decode_candidate(event)
 
         assert candidate is not None
-        self.assertIsNone(candidate["position"]["lat_deg"])
+        self.assertAlmostEqual(59.98868115019719, candidate["position"]["lat_deg"])
+        self.assertAlmostEqual(10.599719210771538, candidate["position"]["lon_deg"])
+        self.assertIsNone(candidate["position"]["alt_m"])
         self.assertEqual(5.5, candidate["attitude"]["pitch_deg"])
         self.assertEqual(-2.2, candidate["attitude"]["roll_deg"])
         self.assertEqual(90.0, candidate["attitude"]["yaw_deg"])
+        self.assertEqual(90.0, candidate["heading"]["aircraft_deg"])
         self.assertEqual(12.3, candidate["raw"]["relative_height_m_candidate"])
-        self.assertEqual("candidate", candidate["quality"]["attitude"])
+        self.assertEqual("probable", candidate["quality"]["position"])
+        self.assertEqual("probable", candidate["quality"]["attitude"])
+        self.assertEqual("unknown", candidate["quality"]["altitude"])
+
+    def test_gps_glns_candidate_decodes_hmsl_millimetres(self) -> None:
+        payload = bytearray(34)
+        struct.pack_into("<iii", payload, 0, 103_931_366, 591_011_495, 7_420)
+        struct.pack_into("<ffff", payload, 12, 0.0, 0.0, 0.0, 0.8)
+        struct.pack_into("<HH", payload, 28, 18, 99)
+        payload[33] = 1
+
+        candidate = decode_candidate(_frame_event(cmd_set=0x03, cmd_id=0x57, payload=bytes(payload)))
+
+        assert candidate is not None
+        self.assertAlmostEqual(59.1011495, candidate["position"]["lat_deg"])
+        self.assertAlmostEqual(10.3931366, candidate["position"]["lon_deg"])
+        self.assertAlmostEqual(7.42, candidate["position"]["alt_m"])
+        self.assertEqual("mean_sea_level_geoid", candidate["altitude"]["reference"])
+        self.assertEqual("candidate", candidate["quality"]["altitude"])
+        self.assertEqual(18, candidate["raw"]["satellites"])
+        self.assertTrue(candidate["raw"]["home_point_recorded_candidate"])
+
+    def test_gps_glns_duml_result_uses_the_same_decoder(self) -> None:
+        payload = struct.pack("<iii", 103_931_366, 591_011_495, 7_420)
+        event = {
+            "type": "DUML_RESULT",
+            "schema": "dji-rc2-telemetry/v1",
+            "session_id": "gps-result",
+            "status": "ok",
+            "request": {"cmd_set": 0x03, "cmd_id": 0x57},
+            "response": {"payload_b64": base64.b64encode(payload).decode("ascii")},
+        }
+
+        candidate = decode_candidate(event)
+
+        assert candidate is not None
+        self.assertAlmostEqual(7.42, candidate["position"]["alt_m"])
+        self.assertEqual("candidate", candidate["quality"]["altitude"])
 
     def test_gimbal_candidate_uses_tenth_degree_layout(self) -> None:
         payload = struct.pack("<hhh", -600, 10, 25) + bytes(6)
@@ -168,6 +208,7 @@ class SessionWriterTest(unittest.TestCase):
 
     def test_home_point_state_remains_candidate_and_position_null(self) -> None:
         payload = bytearray(102)
+        struct.pack_into("<ddf", payload, 0, 0.1814, 1.0315, 323.843)
         struct.pack_into("<H", payload, 20, 0x47)
 
         candidate = decode_candidate(_frame_event(cmd_set=0x03, cmd_id=0x44, payload=bytes(payload)))
@@ -175,6 +216,9 @@ class SessionWriterTest(unittest.TestCase):
         assert candidate is not None
         self.assertIsNone(candidate["position"]["lat_deg"])
         self.assertTrue(candidate["raw"]["home_point_recorded_candidate"])
+        self.assertEqual("rejected", candidate["quality"]["altitude"])
+        self.assertIsNone(candidate["home"]["alt_m"])
+        self.assertAlmostEqual(323.843, candidate["raw"]["home_altitude_raw_f32"], places=3)
 
     def test_analyzer_does_not_classify_rc_channels_as_camera_pitch(self) -> None:
         rc_payload = b"\x00" + struct.pack("<8H", 256, 0, 1024, 1024, 1024, 1024, 1684, 1024)
@@ -184,7 +228,7 @@ class SessionWriterTest(unittest.TestCase):
 
             report = analyze_session(session)
 
-            self.assertEqual(["03/43", "03/44", "04/05"], report["missing_georeference_families"])
+            self.assertEqual(["03/43", "03/44", "03/57", "04/05"], report["missing_georeference_families"])
             self.assertEqual({}, report["candidate_frames"])
             self.assertEqual(
                 "candidate_rc_channels_not_camera_attitude",

@@ -39,6 +39,7 @@ class TelemetryRelayClient(
     private val sessionId: String,
     private val appVersion: String,
     private val controllerModel: String,
+    private val controllerIdentity: ControllerIdentity,
     private val scope: CoroutineScope,
     private val onStatus: (TelemetryStatus) -> Unit,
     private val onCommand: (TelemetryRelayCommand) -> Unit,
@@ -70,7 +71,16 @@ class TelemetryRelayClient(
                     )
                     reconnectDelayMs = 250L
 
-                    writeLine(writer, TelemetryHelloEvent(sessionId, config, appVersion, controllerModel))
+                    writeLine(
+                        writer,
+                        TelemetryHelloEvent(
+                            sessionId,
+                            config,
+                            appVersion,
+                            controllerModel,
+                            controllerIdentity
+                        )
+                    )
                     val readerJob = scope.launch(Dispatchers.IO) {
                         try {
                             connectedSocket.getInputStream().bufferedReader(Charsets.UTF_8).useLines { lines ->

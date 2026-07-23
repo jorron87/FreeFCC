@@ -180,7 +180,7 @@ Each command is a small binary packet with a magic byte (`0x55`), a header with 
 
 This fork adds a separate Telemetry tab for raw metadata research. It can stream `RAW_CHUNK` and validated `DUML_FRAME` NDJSON records to a local Mac on port `8765`.
 
-`1.5.3-research.6` defaults to `bench_wrapped_socket` on `127.0.0.1:40007`.
+`1.5.3-research.7` defaults to `bench_wrapped_socket` on `127.0.0.1:40007`.
 The parser accepts both direct DUML and the observed
 `55 cc 30 75 + u32 little-endian length + inner DUML` envelope. Inner frames
 are emitted only after encoded-length, CRC-8 and CRC-16 validation. The
@@ -210,22 +210,39 @@ Four one-shot probes from `research.3` reported `no_response`. Review of
 bit. `research.4` accepted such replies only when CRC, sequence, reverse routing
 and command set/ID still matched, but physical `03/43` and `00/51` tests still
 returned no matched response. `research.5` added bounded raw response
-diagnostics. The preferred `research.6` path is now passive `40007`: observed
+diagnostics. The preferred `research.6` path is now read-only `40007`: observed
 families `03/43`, `03/44`, `04/05` and `51/14` are retained as candidates.
 Aircraft identity is extracted only from a CRC-valid `51/14` frame on the
-observed `0xEE -> App` route. GPS coordinates remain null until a controlled
-Neo 2 correlation verifies offsets, types and scale.
+observed `0xEE -> App` route.
 
-For the preferred passive path, use the Mac companion:
+The 2026-07-23 Neo 2 bench correlation matched `03/43` latitude/longitude and
+aircraft yaw against DJI Fly/operator observations. These fields are now
+`probable` for that model and firmware scope. `03/44` exposed a `323.843 m`
+home-altitude value while surveyed terrain was about `7 m AMSL`; the receiver
+therefore records it only as pressure/fused-datum diagnostics and never as
+geodetic altitude. `03/57 GPS GLNS Info` contains the desired signed int32
+`hMSL` millimetres field, but was not present in the short capture and a
+one-shot `40009` request returned no response. Absolute altitude remains null
+until a CRC-valid `03/57` frame is captured and correlated.
+
+`research.7` also adds the RC Android system serial and its source to `HELLO`.
+This is the preferred RC identity path; read-only `00/51` requests to the
+ground-link components returned only status bytes or no response.
+
+Run the Mac companion:
 
 ```sh
 cd tools/mac-telemetry-receiver
-python -m rc2_telemetry_receiver --adb-pcap --out /Users/jorgen/Documents/RC/captures
+python -m rc2_telemetry_receiver \
+  --listen 0.0.0.0:8765 \
+  --out /Users/jorgen/Documents/RC/captures
 ```
 
-The receiver preserves raw bytes and keeps latitude/longitude unknown until a version-scoped field mapping has been verified.
+The receiver preserves raw bytes and clears current georeference values after
+capture gaps. A one-shot GPS hMSL research request is available as
+`--probe-gps-hmsl`; it is never retried automatically.
 
-Current published research build: `1.5.3-research.6`. It remains bench-only
+Current research build: `1.5.3-research.7`. It remains bench-only
 until its physical RC2 gate has passed.
 
 ### Research Update Channel

@@ -72,11 +72,14 @@ class TelemetryEventsTest {
                 capturePort = 40007
             ),
             appVersion = "test",
-            controllerModel = "rc331"
+            controllerModel = "rc331",
+            controllerIdentity = ControllerIdentity("RC123H103", "Build.getSerial")
         ).toJsonLine()
 
         assertTrue(line.contains("\"source_mode\":\"bench_wrapped_socket\""))
         assertTrue(line.contains("\"source_port\":40007"))
+        assertTrue(line.contains("\"controller_serial\":\"RC123H103\""))
+        assertTrue(line.contains("\"controller_serial_source\":\"Build.getSerial\""))
     }
 
     @Test

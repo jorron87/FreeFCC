@@ -112,6 +112,7 @@ class TelemetryCaptureService : Service() {
             sessionId = sessionId,
             appVersion = FccViewModel.APP_VERSION,
             controllerModel = Build.DEVICE,
+            controllerIdentity = ControllerIdentityReader.read(),
             scope = scope,
             onStatus = { TelemetryStatusBus.update(it) },
             onCommand = ::handleRelayCommand,

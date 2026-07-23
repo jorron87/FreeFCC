@@ -39,7 +39,8 @@ data class TelemetryHelloEvent(
     val sessionId: String,
     val config: TelemetryConfig,
     val appVersion: String,
-    val controllerModel: String
+    val controllerModel: String,
+    val controllerIdentity: ControllerIdentity = ControllerIdentity(null, null)
 ) : TelemetryEvent("HELLO") {
     override fun toJsonLine(): String = jsonObject(
         "type" to type,
@@ -50,6 +51,8 @@ data class TelemetryHelloEvent(
         "source_port" to config.capturePort,
         "source_id" to config.sourceId,
         "controller_model" to controllerModel,
+        "controller_serial" to controllerIdentity.serial.orEmpty(),
+        "controller_serial_source" to controllerIdentity.serialSource.orEmpty(),
         "controller_firmware" to config.controllerFirmware,
         "dji_fly_version" to config.djiFlyVersion,
         "aircraft_model" to config.aircraftModel,
