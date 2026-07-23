@@ -3,30 +3,29 @@ package com.freefcc.app
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.provider.Settings
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 
 /**
- * Foreground service that keeps FCC mode active by re-applying the FCC
- * profile every [INTERVAL_MS] milliseconds. Runs independently of the
- * Activity lifecycle so it continues working when the user switches to DJI Fly.
+ * Event-driven Auto FCC service.
  *
- * The keepalive profile is loaded once at service creation and cached —
- * re-parsing the JSON asset and rebuilding frames with CRC on every 2-second
- * tick was wasteful CPU on the controller.
- *
- * The persistent keepalive flag (stored in SharedPreferences) is read at start
- * so a sticky restart after a system kill respects the user's last intent.
+ * It opens no DJI socket while waiting. A localized Home Point event from the
+ * original DJI Fly app triggers one complete FCC profile, then the service
+ * re-arms for a later aircraft session.
  */
 class FccKeepaliveService : Service() {
 
@@ -35,13 +34,19 @@ class FccKeepaliveService : Service() {
         const val NOTIFICATION_ID = 9012
         const val ACTION_START = "com.freefcc.app.START_KEEPALIVE"
         const val ACTION_STOP = "com.freefcc.app.STOP_KEEPALIVE"
-        private const val INTERVAL_MS = 2000L
         private const val PREFS_NAME = "freefcc"
         private const val PREF_KEEPALIVE = "keepalive_running"
+        private const val HOME_POINT_DEBOUNCE_MS = 30_000L
+        private const val TAG = "FreeFCC-AutoFCC"
+        private val homePointEvents = Channel<Long>(Channel.CONFLATED)
+
+        @Volatile private var serviceArmed = false
+        @Volatile private var lastAcceptedAtMs = 0L
 
         fun start(context: Context) {
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit().putBoolean(PREF_KEEPALIVE, true).apply()
+            if (!isDjiFlyTextAccessEnabled(context)) return
             val intent = Intent(context, FccKeepaliveService::class.java).apply {
                 action = ACTION_START
             }
@@ -53,131 +58,129 @@ class FccKeepaliveService : Service() {
         }
 
         fun stop(context: Context) {
+            serviceArmed = false
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit().putBoolean(PREF_KEEPALIVE, false).apply()
-            val intent = Intent(context, FccKeepaliveService::class.java).apply {
-                action = ACTION_STOP
-            }
-            context.startService(intent)
+            context.startService(
+                Intent(context, FccKeepaliveService::class.java).apply {
+                    action = ACTION_STOP
+                }
+            )
         }
 
-        /** Returns whether the service should be running, based on the persistent flag. */
         fun isRunningFlagSet(context: Context): Boolean =
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .getBoolean(PREF_KEEPALIVE, false)
+
+        fun isDjiFlyTextAccessEnabled(context: Context): Boolean {
+            val expected = ComponentName(context, DjiFlyAccessibilityService::class.java)
+            val enabled = Settings.Secure.getString(
+                context.contentResolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            ).orEmpty()
+            return enabled.split(':')
+                .mapNotNull(ComponentName::unflattenFromString)
+                .any { it == expected }
+        }
+
+        @Synchronized
+        fun notifyHomePointDetected(): Boolean {
+            if (!serviceArmed) return false
+            val now = System.currentTimeMillis()
+            if (now - lastAcceptedAtMs < HOME_POINT_DEBOUNCE_MS) return false
+            if (!homePointEvents.trySend(now).isSuccess) return false
+            lastAcceptedAtMs = now
+            return true
+        }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var keepaliveJob: Job? = null
+    private var worker: Job? = null
     private val transport = DumlTransport()
-
-    /** Cached at onCreate — loading JSON + building frames on every 2s tick is wasteful. */
-    private var cachedFrames: List<ByteArray>? = null
-    private var cachedInterFrameDelay: Long = 100
-    private var cachedReadWindowMs: Int = 80
-    private var cachedPort: Int = DumlTransport.PORT
-
-    override fun onCreate() {
-        super.onCreate()
-        createNotificationChannel()
-        // Load the keepalive profile once and cache the built frames.
-        // If the asset is missing/corrupt the cache stays null and the loop no-ops.
-        runCatching {
-            val profile = Profiles.load(this, "fcc_keepalive.json")
-            cachedFrames = profile.frames
-            cachedInterFrameDelay = profile.interFrameDelay
-            cachedReadWindowMs = profile.readWindowMs
-            cachedPort = profile.port
-        }
-    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                keepaliveJob?.cancel()
+                serviceArmed = false
+                worker?.cancel()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
             }
-            else -> {
-                // ACTION_START or a null-intent sticky restart.
-                // Respect the persistent flag so a system-kill-and-restart
-                // doesn't silently re-enable keepalive after the user stopped it.
-                if (intent?.action == null && !isRunningFlagSet(this)) {
+            ACTION_START -> {
+                if (!isDjiFlyTextAccessEnabled(this)) {
+                    getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                        .edit().putBoolean(PREF_KEEPALIVE, false).apply()
                     stopSelf()
                     return START_NOT_STICKY
                 }
-                // If the profile failed to load, don't become a silent
-                // foreground no-op — stop immediately.
-                if (cachedFrames == null) {
-                    stopSelf()
-                    return START_NOT_STICKY
-                }
+                createNotificationChannel()
                 startForeground(NOTIFICATION_ID, createNotification())
-                startKeepaliveLoop()
+                serviceArmed = true
+                startWorker()
+            }
+            else -> {
+                serviceArmed = false
+                stopSelf()
             }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
-    private fun startKeepaliveLoop() {
-        keepaliveJob?.cancel()
-        keepaliveJob = scope.launch {
-            val frames = cachedFrames ?: return@launch
-            while (true) {
-                // Delay at the loop start, not the end, so the interval is
-                // INTERVAL_MS regardless of how long the send takes. The first
-                // tick fires after INTERVAL_MS (not immediately).
-                delay(INTERVAL_MS)
-                // Retry acquiring the lock with a short backoff instead of
-                // silently skipping the tick. This prevents a gap where DJI
-                // Fly can reset the radio to CE while another operation
-                // (LED, device info, manual FCC apply) holds the lock for
-                // ~1-2s. With the retry, FCC is re-applied within ~200ms
-                // of the lock being released, instead of up to INTERVAL_MS
-                // later.
-                var sent = false
-                for (retry in 0 until 10) {
-                    if (HardwareLock.tryBegin()) {
-                        try {
-                            transport.sendFrames(
-                                frames = frames,
-                                rounds = 1,
-                                interFrameDelayMs = cachedInterFrameDelay,
-                                readWindowMs = cachedReadWindowMs,
-                                port = cachedPort
-                            )
-                            sent = true
-                        } catch (e: kotlinx.coroutines.CancellationException) {
-                            throw e
-                        } catch (_: Exception) {
-                        } finally {
-                            HardwareLock.end()
-                        }
-                        break
-                    }
-                    // Lock held by another op — wait 200ms and retry.
-                    // 10 retries × 200ms = 2s max wait, covering any
-                    // reasonable hardware operation.
-                    delay(200)
-                }
-                // If we never got the lock (another op held it for >2s),
-                // the next loop iteration will try again after INTERVAL_MS.
+    private fun startWorker() {
+        if (worker?.isActive == true) return
+        worker = scope.launch {
+            while (serviceArmed) {
+                homePointEvents.receive()
+                if (!serviceArmed) break
+                applyFullProfileOnce()
             }
+        }
+    }
+
+    private fun applyFullProfileOnce() {
+        val hardwareLease = HardwareLock.tryBegin()
+        if (hardwareLease == null) {
+            Log.w(TAG, "Home Point FCC skipped: controller hardware busy")
+            return
+        }
+        val portLease = DumlPortSessionLock.tryBegin(DumlTransport.PORT)
+        if (portLease == null) {
+            hardwareLease.close()
+            Log.w(TAG, "Home Point FCC skipped: port 40009 busy")
+            return
+        }
+        try {
+            val profile = Profiles.load(this, "fcc.json")
+            val sent = transport.sendFrames(
+                frames = profile.frames,
+                rounds = profile.rounds,
+                interFrameDelayMs = profile.interFrameDelay,
+                interRoundDelayMs = profile.interRoundDelay,
+                readWindowMs = profile.readWindowMs,
+                port = DumlTransport.PORT,
+                pinPort = true
+            )
+            Log.i(TAG, "Home Point FCC one-shot completed=$sent")
+        } catch (e: Exception) {
+            Log.e(TAG, "Home Point FCC failed", e)
+        } finally {
+            portLease.close()
+            hardwareLease.close()
         }
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "FCC Keepalive",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Keeps FCC mode active in the background"
-            }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL_ID,
+                    "Auto FCC",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "Waits for DJI Fly Home Point without opening a DUML socket"
+                }
+            )
         }
     }
 
@@ -187,28 +190,32 @@ class FccKeepaliveService : Service() {
         } else {
             Notification.Builder(this)
         }
-        // Tapping the notification opens the app
         val openIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
-        val pendingIntent = android.app.PendingIntent.getActivity(
-            this, 0, openIntent,
-            android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            openIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         return builder
-            .setContentTitle("FreeFCC")
-            .setContentText("Maintaining FCC mode...")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("FreeFCC Auto FCC")
+            .setContentText("Armed; waiting for DJI Fly Home Point")
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .setContentIntent(pendingIntent)
             .build()
     }
 
     override fun onDestroy() {
-        keepaliveJob?.cancel()
+        serviceArmed = false
+        worker?.cancel()
         scope.cancel()
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
 }

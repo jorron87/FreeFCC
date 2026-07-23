@@ -21,6 +21,7 @@ def decode_candidate(event: dict[str, Any]) -> dict[str, Any] | None:
         "session_id": event.get("session_id", ""),
         "source_id": event.get("source", "rc2"),
         "captured_at": event.get("wall_time_utc") or event.get("captured_at", ""),
+        "elapsed_realtime_ns": int(event.get("elapsed_realtime_ns", 0) or 0),
     }
     if event.get("type") == "DUML_RESULT":
         request = event.get("request", {})

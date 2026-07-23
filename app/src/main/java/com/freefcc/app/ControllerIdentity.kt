@@ -1,5 +1,6 @@
 package com.freefcc.app
 
+import android.annotation.SuppressLint
 import android.os.Build
 
 data class ControllerIdentity(
@@ -8,6 +9,7 @@ data class ControllerIdentity(
 )
 
 object ControllerIdentityReader {
+    @SuppressLint("MissingPermission")
     fun read(): ControllerIdentity {
         val candidates = buildList {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

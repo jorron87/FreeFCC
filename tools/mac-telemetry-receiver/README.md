@@ -10,10 +10,14 @@ python -m rc2_telemetry_receiver --listen 0.0.0.0:8765 --out /Users/jorgen/Docum
 ```
 
 The same process binds a control socket to Mac localhost only (`127.0.0.1:8766`).
-In the Android Telemetry tab, select `40007 Wrapped` for the preferred passive
-metadata source. `40009 Direct` remains available for the narrower controller
-stream. Each app start opens one read-only DUML connection and does not
-automatically reconnect it after EOF.
+In the Android Telemetry tab, select `8902 Passive`. The app opens one
+read-only connection, sends no source bytes, and does not reconnect after EOF.
+`open_silent` means the endpoint accepted the connection but published no data.
+`40009 Direct` and `40007 Snapshot` remain bench sources.
+
+The receiver stores chunks plus `raw-stream.bin`, parses `F5/F6/F8` records and
+writes one `GEOREFERENCE_SAMPLE` for every one-second Android tick. Stale or
+unavailable fields are written as null rather than reused.
 Request one decoded FC OSD candidate sample:
 
 ```sh
@@ -60,7 +64,7 @@ When capture already holds the requested port, the command returns
 Remote DUML is a bench research interface. An external local script may
 schedule one-shot requests, but the receiver does not start polling on its own.
 
-`1.5.3-research.7` accepts a correlated DJI reply even when the RESPONSE bit is
+`1.5.3-research.8` accepts a correlated DJI reply even when the RESPONSE bit is
 not set, matching the behavior documented by `dji-firmware-tools`. CRC,
 sequence, reverse routing and command set/ID must still match. This change is
 unit-tested. Every result also includes a bounded diagnostics block showing
@@ -82,6 +86,14 @@ python -m rc2_telemetry_receiver --adb-pcap --out /Users/jorgen/Documents/RC/cap
 
 The tool writes `session.ndjson`, raw chunk files, and `session-summary.json`.
 It does not upload artifacts or promote GPS/attitude fields to verified values.
+
+Replay source events and regenerate 8902 candidates and samples:
+
+```sh
+python -m rc2_telemetry_receiver \
+  --replay /path/to/session.ndjson \
+  --out /Users/jorgen/Documents/RC/replayed
+```
 
 Analyze a saved session and inventory georeference candidates:
 

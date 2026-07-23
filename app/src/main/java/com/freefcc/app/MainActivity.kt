@@ -1,11 +1,15 @@
 package com.freefcc.app
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
@@ -36,6 +40,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.launch
 import kotlin.math.sin
 import kotlin.math.PI
@@ -66,9 +71,18 @@ private val BottomNavHeight = 72.dp
 class MainActivity : ComponentActivity() {
 
     private val viewModel: FccViewModel by viewModels()
+    private val notificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
         viewModel.init()
 
         setContent {
@@ -101,7 +115,7 @@ private fun AppRoot(viewModel: FccViewModel) {
         entrance.animateTo(1f, tween(700, easing = EaseOutCubic))
     }
 
-    BoxWithConstraints(
+    Box(
         modifier = Modifier
             .fillMaxSize()
             .background(
@@ -202,7 +216,7 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "${runtime.sourceMode.ifBlank { "bench_wrapped_socket" }}:${runtime.sourcePort}",
+                        "${runtime.sourceMode.ifBlank { "rc2_publish_8902" }}:${runtime.sourcePort}",
                         color = Amber,
                         fontSize = 12.sp,
                         fontFamily = FontFamily.Monospace
@@ -212,7 +226,7 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
 
             Spacer(Modifier.height(16.dp))
             BodyText(
-                "Bench-only read-only capture. One socket is opened per explicit start and is never reconnected automatically. Stop if DJI Fly reconnects or the control link changes.",
+                "Read-only capture with one explicit source connection. Port 8902 is passive and persistent; 40007/40009 remain bench-only single connections with no automatic reconnect.",
                 Amber
             )
 
@@ -224,6 +238,10 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 Spacer(Modifier.height(12.dp))
                 BodyText(runtime.lastError, Red)
             }
+            Spacer(Modifier.height(12.dp))
+            InfoRow("Source", runtime.sourceStatus.uppercase(), if (runtime.sourceStatus == "active") Green else Amber)
+            Spacer(Modifier.height(8.dp))
+            InfoRow("Records", runtime.records.toString(), TextWhite)
         }
 
         Spacer(Modifier.height(16.dp))
@@ -255,14 +273,18 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 enabled = !runtime.running
             )
             Spacer(Modifier.height(14.dp))
-            Text("DUML capture port", color = TextGray, fontSize = 12.sp)
+            Text("Read-only source", color = TextGray, fontSize = 12.sp)
             Spacer(Modifier.height(8.dp))
             SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                listOf("40007 Wrapped" to "40007", "40009 Direct" to "40009").forEachIndexed { index, choice ->
+                listOf(
+                    "8902 Passive" to "8902",
+                    "40009 Direct" to "40009",
+                    "40007 Snapshot" to "40007"
+                ).forEachIndexed { index, choice ->
                     SegmentedButton(
                         selected = state.telemetryCapturePort == choice.second,
                         onClick = { viewModel.updateTelemetryCapturePort(choice.second) },
-                        shape = SegmentedButtonDefaults.itemShape(index, 2),
+                        shape = SegmentedButtonDefaults.itemShape(index, 3),
                         enabled = !runtime.running
                     ) {
                         Text(choice.first, fontSize = 12.sp)
@@ -273,12 +295,12 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
             ResearchTextField(
                 value = state.telemetryCapturePort,
                 onValueChange = viewModel::updateTelemetryCapturePort,
-                label = "Custom supported port",
-                placeholder = "40007",
+                label = "Custom research port",
+                placeholder = "8902",
                 enabled = !runtime.running
             )
             Spacer(Modifier.height(8.dp))
-            BodyText("Supported research ports: 40007, 40009, 8901-8904.", TextDim)
+            BodyText("8902 is preferred. 40007 never polls or reconnects automatically.", TextDim)
             Spacer(Modifier.height(18.dp))
             if (runtime.running) {
                 GlowButton("Stop Relay", Red) { viewModel.stopTelemetryRelay() }
@@ -486,7 +508,7 @@ private fun FccPage(state: AppState, viewModel: FccViewModel) {
                             Text("Keepalive", color = TextWhite, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                             Spacer(Modifier.height(2.dp))
                             Text(
-                                if (state.isKeepaliveRunning) "Re-applying FCC every 2s to prevent CE reset"
+                                if (state.isKeepaliveRunning) "Armed for DJI Fly Home Point"
                                 else "Keep FCC active while DJI Fly runs",
                                 color = if (state.isKeepaliveRunning) Green else TextGray,
                                 fontSize = 11.sp,
@@ -646,7 +668,7 @@ private fun FccPage(state: AppState, viewModel: FccViewModel) {
                     Text("Auto-FCC", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "Auto-connect, apply FCC, start keepalive, and launch DJI Fly.",
+                        "Waits for DJI Fly Home Point, then applies FCC once. No DUML polling while armed.",
                         color = TextGray,
                         fontSize = 12.sp,
                         lineHeight = 17.sp

@@ -21,7 +21,7 @@ class TelemetryEventsTest {
         val line = event.toJsonLine()
 
         assertTrue(line.contains("\"type\":\"RAW_CHUNK\""))
-        assertTrue(line.contains("\"schema\":\"dji-rc2-telemetry/v1\""))
+        assertTrue(line.contains("\"schema\":\"dji-rc2-telemetry/v2\""))
         assertTrue(line.contains("\"bytes_b64\":\"VQ0EAQ==\""))
         assertTrue(line.contains("\"crc32\":\"${crc32Hex(byteArrayOf(0x55, 0x0d, 0x04, 0x01))}\""))
     }
@@ -80,6 +80,43 @@ class TelemetryEventsTest {
         assertTrue(line.contains("\"source_port\":40007"))
         assertTrue(line.contains("\"controller_serial\":\"RC123H103\""))
         assertTrue(line.contains("\"controller_serial_source\":\"Build.getSerial\""))
+    }
+
+    @Test
+    fun `hello records persistent passive 8902 policy`() {
+        val line = TelemetryHelloEvent(
+            sessionId = "session-2",
+            config = TelemetryConfig(
+                host = "192.168.5.99",
+                port = 8765,
+                sourceId = "neo2"
+            ),
+            appVersion = "test",
+            controllerModel = "rc331"
+        ).toJsonLine()
+
+        assertTrue(line.contains("\"schema\":\"dji-rc2-telemetry/v2\""))
+        assertTrue(line.contains("\"source_mode\":\"rc2_publish_8902\""))
+        assertTrue(line.contains("\"source_port\":8902"))
+        assertTrue(line.contains("\"source_policy\":\"persistent_read_only\""))
+        assertTrue(line.contains("\"sample_interval_ms\":1000"))
+    }
+
+    @Test
+    fun `telemetry tick preserves source freshness`() {
+        val line = TelemetryTickEvent(
+            sessionId = "session-2",
+            source = "rc2_publish_8902",
+            port = 8902,
+            elapsedRealtimeNs = 8_000_000_000,
+            sourceStatus = "active",
+            lastByteAgeMs = 12,
+            sourceClockMs = 77
+        ).toJsonLine()
+
+        assertTrue(line.contains("\"type\":\"TELEMETRY_TICK\""))
+        assertTrue(line.contains("\"last_byte_age_ms\":12"))
+        assertTrue(line.contains("\"source_clock_ms\":77"))
     }
 
     @Test

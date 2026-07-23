@@ -19,12 +19,18 @@ from rc2_telemetry_receiver.duml import (
     crc8,
 )
 from rc2_telemetry_receiver.pcap import iter_pcap_tcp_payloads
+from rc2_telemetry_receiver.publish8902 import (
+    PublishParseError,
+    PublishRecord,
+    Rc2PublishStreamParser,
+)
 from rc2_telemetry_receiver.receiver import (
     RelayControlHub,
     SessionWriter,
     error_event,
     extract_serial_candidate,
     handle_payload_stream,
+    replay_session,
 )
 from rc2_telemetry_receiver.telemetry import analyze_session, decode_candidate
 
@@ -70,7 +76,132 @@ class DumlParserTest(unittest.TestCase):
         self.assertEqual("truncated_frame", results[0].reason)
 
 
+class Publish8902ParserTest(unittest.TestCase):
+    def test_split_record_extracts_clock_and_marker(self) -> None:
+        raw = _publish_record(0xF5, 71, 0x1FFFE)
+        parser = Rc2PublishStreamParser()
+
+        self.assertEqual([], parser.feed(raw[:6]))
+        result = parser.feed(raw[6:])[0]
+
+        self.assertIsInstance(result, PublishRecord)
+        assert isinstance(result, PublishRecord)
+        self.assertEqual(0xF5, result.marker)
+        self.assertEqual(71, result.length)
+        self.assertEqual(0x1FFFE, result.source_clock_ms)
+
+    def test_invalid_length_resyncs(self) -> None:
+        bad = b"\xf5\x64\x04\x00\x00\x00\x00\x00"
+        results = Rc2PublishStreamParser().feed(
+            bad + _publish_record(0xF8, 16, 22)
+        )
+
+        self.assertTrue(
+            any(
+                isinstance(result, PublishParseError)
+                and result.reason == "publish_invalid_length"
+                for result in results
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(result, PublishRecord)
+                and result.source_clock_ms == 22
+                for result in results
+            )
+        )
+
+
 class SessionWriterTest(unittest.TestCase):
+    def test_8902_raw_stream_produces_records_readiness_and_one_hz_sample(self) -> None:
+        record = bytearray(_publish_record(0xF5, 71, 1234))
+        struct.pack_into("<I", record, 48, 0x00815100)
+        record[52] = 18
+        record[55] = 5
+        record[61:65] = b"\x0f\x8a\x20\x7f"
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = SessionWriter(Path(tmp))
+            writer.handle_event(
+                {
+                    "type": "HELLO",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "publish",
+                    "source_mode": "rc2_publish_8902",
+                }
+            )
+            writer.handle_event(
+                {
+                    "type": "SOURCE_STATUS",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "publish",
+                    "status": "active",
+                    "elapsed_realtime_ns": 1_000_000_000,
+                }
+            )
+            raw_event = {
+                **_raw_event(bytes(record), port=8902),
+                "session_id": "publish",
+                "source": "rc2_publish_8902",
+                "elapsed_realtime_ns": 1_100_000_000,
+            }
+            writer.handle_event(raw_event)
+            writer.handle_event(
+                {
+                    "type": "TELEMETRY_TICK",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "publish",
+                    "source": "rc2_publish_8902",
+                    "source_status": "active",
+                    "source_clock_ms": 1234,
+                    "elapsed_realtime_ns": 2_000_000_000,
+                    "wall_time_utc": "2026-07-23T22:00:00.000Z",
+                }
+            )
+
+            assert writer.session_dir is not None
+            summary = json.loads((writer.session_dir / "session-summary.json").read_text())
+            events = [
+                json.loads(line)
+                for line in (writer.session_dir / "session.ndjson").read_text().splitlines()
+            ]
+
+            self.assertEqual(1, summary["stream_records"])
+            self.assertEqual(1, summary["georeference_samples"])
+            self.assertEqual(18, summary["georef"]["gnss_readiness"]["satellites"])
+            self.assertTrue(any(event["type"] == "GEOREFERENCE_SAMPLE" for event in events))
+            self.assertEqual(bytes(record), (writer.session_dir / "raw-stream.bin").read_bytes())
+
+    def test_replay_preserves_publish_stream_bytes(self) -> None:
+        record = _publish_record(0xF6, 32, 44)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.ndjson"
+            events = [
+                {
+                    "type": "HELLO",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "replay",
+                    "source_mode": "rc2_publish_8902",
+                },
+                {
+                    **_raw_event(record, port=8902),
+                    "session_id": "replay",
+                    "source": "rc2_publish_8902",
+                },
+            ]
+            source.write_text(
+                "".join(json.dumps(event) + "\n" for event in events),
+                encoding="utf-8",
+            )
+
+            writer = replay_session(source, root / "replayed")
+
+            assert writer.session_dir is not None
+            self.assertEqual(
+                record,
+                (writer.session_dir / "raw-stream.bin").read_bytes(),
+            )
+
     def test_payload_stream_writes_ndjson_summary_and_raw_bytes(self) -> None:
         frame = build_test_frame(payload=b"\x10\x20")
         with tempfile.TemporaryDirectory() as tmp:
@@ -403,6 +534,31 @@ def _frame_event(
         "validation_status": "valid",
         "raw_frame_b64": base64.b64encode(frame).decode("ascii"),
     }
+
+
+def _raw_event(payload: bytes, *, port: int) -> dict[str, object]:
+    return {
+        "type": "RAW_CHUNK",
+        "schema": "dji-rc2-telemetry/v2",
+        "session_id": "raw-session",
+        "seq": 1,
+        "wall_time_utc": "2026-07-23T22:00:00.000Z",
+        "elapsed_realtime_ns": 0,
+        "source": "unit",
+        "direction": "controller_to_client",
+        "port": port,
+        "bytes_b64": base64.b64encode(payload).decode("ascii"),
+        "crc32": "00000000",
+    }
+
+
+def _publish_record(marker: int, length: int, source_clock_ms: int) -> bytes:
+    record = bytearray(length)
+    record[0] = marker
+    record[1] = 0x64
+    struct.pack_into("<H", record, 2, length)
+    struct.pack_into("<I", record, 4, source_clock_ms)
+    return bytes(record)
 
 
 def _ipv4_packet(tcp: bytes) -> bytes:

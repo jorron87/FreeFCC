@@ -10,12 +10,17 @@ import java.util.UUID
 import java.util.zip.CRC32
 
 enum class TelemetrySourceMode(val wireName: String) {
+    Rc2PublishStream("rc2_publish_8902"),
     BenchWrappedSocket("bench_wrapped_socket"),
     BenchDirectSocket("bench_direct_socket");
 
     companion object {
         fun forPort(port: Int): TelemetrySourceMode =
-            if (port == DumlTransport.PORT_LED) BenchWrappedSocket else BenchDirectSocket
+            when (port) {
+                DumlTransport.PORT_ALT_2 -> Rc2PublishStream
+                DumlTransport.PORT_LED -> BenchWrappedSocket
+                else -> BenchDirectSocket
+            }
     }
 }
 
@@ -23,8 +28,10 @@ data class TelemetryConfig(
     val host: String,
     val port: Int,
     val sourceId: String,
-    val capturePort: Int = DumlTransport.PORT_LED,
+    val capturePort: Int = DumlTransport.PORT_ALT_2,
     val sourceMode: TelemetrySourceMode = TelemetrySourceMode.forPort(capturePort),
+    val rawRelayEnabled: Boolean = true,
+    val sampleIntervalMs: Long = 1_000,
     val controllerFirmware: String = "",
     val djiFlyVersion: String = "",
     val aircraftModel: String = "",
@@ -49,6 +56,13 @@ data class TelemetryHelloEvent(
         "app_version" to appVersion,
         "source_mode" to config.sourceMode.wireName,
         "source_port" to config.capturePort,
+        "source_policy" to if (config.sourceMode == TelemetrySourceMode.Rc2PublishStream) {
+            "persistent_read_only"
+        } else {
+            "explicit_single_connection"
+        },
+        "raw_relay_enabled" to config.rawRelayEnabled,
+        "sample_interval_ms" to config.sampleIntervalMs,
         "source_id" to config.sourceId,
         "controller_model" to controllerModel,
         "controller_serial" to controllerIdentity.serial.orEmpty(),
@@ -89,6 +103,7 @@ data class RawChunkEvent(
 data class DumlFrameEvent(
     val sessionId: String,
     val rawSeq: Long,
+    val elapsedRealtimeNs: Long,
     val frame: DumlFrameParser.ParsedFrame,
     val source: String,
     val direction: String,
@@ -100,6 +115,7 @@ data class DumlFrameEvent(
         "session_id" to sessionId,
         "raw_seq" to rawSeq,
         "wall_time_utc" to utcNow(),
+        "elapsed_realtime_ns" to elapsedRealtimeNs,
         "source" to source,
         "direction" to direction,
         "port" to port,
@@ -113,6 +129,61 @@ data class DumlFrameEvent(
         "validation_status" to frame.validationStatus,
         "raw_frame_b64" to b64(frame.raw),
         "quality" to "unknown"
+    )
+}
+
+data class TelemetrySourceStatusEvent(
+    val sessionId: String,
+    val source: String,
+    val port: Int,
+    val status: String,
+    val detail: String,
+    val elapsedRealtimeNs: Long,
+    val lastByteAgeMs: Long?
+) : TelemetryEvent("SOURCE_STATUS") {
+    override fun toJsonLine(): String = """
+        {"type":"$type","schema":"$TELEMETRY_SCHEMA","session_id":"${esc(sessionId)}","wall_time_utc":"${utcNow()}","elapsed_realtime_ns":$elapsedRealtimeNs,"source":"${esc(source)}","port":$port,"status":"${esc(status)}","detail":"${esc(detail)}","last_byte_age_ms":${lastByteAgeMs ?: "null"}}
+    """.trimIndent()
+}
+
+data class TelemetryTickEvent(
+    val sessionId: String,
+    val source: String,
+    val port: Int,
+    val elapsedRealtimeNs: Long,
+    val sourceStatus: String,
+    val lastByteAgeMs: Long?,
+    val sourceClockMs: Long?
+) : TelemetryEvent("TELEMETRY_TICK") {
+    override fun toJsonLine(): String = """
+        {"type":"$type","schema":"$TELEMETRY_SCHEMA","session_id":"${esc(sessionId)}","wall_time_utc":"${utcNow()}","elapsed_realtime_ns":$elapsedRealtimeNs,"source":"${esc(source)}","port":$port,"source_status":"${esc(sourceStatus)}","last_byte_age_ms":${lastByteAgeMs ?: "null"},"source_clock_ms":${sourceClockMs ?: "null"}}
+    """.trimIndent()
+}
+
+data class Rc2RecordStatsEvent(
+    val sessionId: String,
+    val elapsedRealtimeNs: Long,
+    val source: String,
+    val port: Int,
+    val totalRecords: Long,
+    val f5Records: Long,
+    val f6Records: Long,
+    val f8Records: Long,
+    val sourceClockMs: Long?
+) : TelemetryEvent("STREAM_RECORD_STATS") {
+    override fun toJsonLine(): String = jsonObject(
+        "type" to type,
+        "schema" to TELEMETRY_SCHEMA,
+        "session_id" to sessionId,
+        "wall_time_utc" to utcNow(),
+        "elapsed_realtime_ns" to elapsedRealtimeNs,
+        "source" to source,
+        "port" to port,
+        "total_records" to totalRecords,
+        "f5_records" to f5Records,
+        "f6_records" to f6Records,
+        "f8_records" to f8Records,
+        "source_clock_ms" to (sourceClockMs ?: -1)
     )
 }
 
@@ -207,7 +278,7 @@ fun crc32Hex(bytes: ByteArray): String {
     return "%08x".format(crc.value)
 }
 
-private const val TELEMETRY_SCHEMA = "dji-rc2-telemetry/v1"
+internal const val TELEMETRY_SCHEMA = "dji-rc2-telemetry/v2"
 
 private fun b64(bytes: ByteArray): String = Base64.getEncoder().encodeToString(bytes)
 

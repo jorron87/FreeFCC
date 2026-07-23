@@ -180,18 +180,27 @@ Each command is a small binary packet with a magic byte (`0x55`), a header with 
 
 This fork adds a separate Telemetry tab for raw metadata research. It can stream `RAW_CHUNK` and validated `DUML_FRAME` NDJSON records to a local Mac on port `8765`.
 
-`1.5.3-research.7` defaults to `bench_wrapped_socket` on `127.0.0.1:40007`.
-The parser accepts both direct DUML and the observed
+`1.5.3-research.8` defaults to the read-only RC2 publish endpoint
+`127.0.0.1:8902`. One socket remains open for the explicit session, the app
+sends no bytes to that endpoint, and a `TELEMETRY_TICK` produces one Mac-side
+`GEOREFERENCE_SAMPLE` per second. A connected but silent endpoint is reported
+as `open_silent`, never as active metadata.
+
+The separate DUML parser accepts both direct DUML and the observed
 `55 cc 30 75 + u32 little-endian length + inner DUML` envelope. Inner frames
 are emitted only after encoded-length, CRC-8 and CRC-16 validation. The
-Telemetry tab can instead select direct `40009` or the known alternate ports
-`8901`-`8904`.
+Telemetry tab can instead select direct `40009` or wrapped `40007` for one
+explicit bench connection.
 
-Treat every Android source as motors-off, propellers-removed bench work only.
-Each explicit start opens exactly one read-only capture connection. A socket
-EOF or I/O failure is recorded as a `capture_gap`, clears current metadata and
-requires an explicit restart; the app does not reconnect the DUML source
-automatically. If DJI Fly reconnects or the control link changes, stop the test.
+Port `8902` uses a bounded parser for `F5 64`, `F6 64`, and `F8 64`
+length-delimited records and their 32-bit controller clock. It is not DUML.
+Raw bytes are retained as chunk artifacts and `raw-stream.bin` for replay.
+Port `40007` must never be polled or reopened periodically.
+
+Each source start opens exactly one read-only connection. EOF or I/O failure
+records a capture gap, clears live metadata, and requires explicit restart.
+The ongoing Android telemetry notification remains active after switching to
+DJI Fly and reports `active`, `open_silent`, gap, or unavailable.
 
 The receiver also exposes a Mac-local control socket on `127.0.0.1:8766`. It
 can request the predefined one-shot `03/43` candidate decoder or send one
@@ -203,14 +212,19 @@ automatically. The selected command port is pinned and never replaced by port
 auto-detection. A command targeting the active capture port is rejected; a
 command on another port can run without tearing down capture.
 
-Physical bench status from 2026-07-22/23: the relay streamed over LAN while DJI Fly remained connected on the tested RC2, and the final `research.3` session recorded 11,512 validated frames with no parser errors or capture gaps. The dominant passive family was `06/AE`; channel 6 correlated with the gimbal pitch wheel and is treated as controller input, not absolute gimbal pitch. No passive `03/43` or `04/05` frames were observed, including after GPS fix and home-point update.
+Physical bench status from 2026-07-22/23: the earlier relay streamed over LAN
+while DJI Fly remained connected on the tested RC2, and the final `research.3`
+session recorded 11,512 validated frames without parser errors. Two Mac-side
+`8902` connects succeeded but delivered zero bytes for 15 seconds, so
+`research.8` requires `active` byte evidence on this Neo 2/firmware before
+relying on that endpoint.
 
 Four one-shot probes from `research.3` reported `no_response`. Review of
 `dji-firmware-tools` then showed that valid DJI replies may omit the RESPONSE
 bit. `research.4` accepted such replies only when CRC, sequence, reverse routing
 and command set/ID still matched, but physical `03/43` and `00/51` tests still
 returned no matched response. `research.5` added bounded raw response
-diagnostics. The preferred `research.6` path is now read-only `40007`: observed
+diagnostics. The `research.6` path used read-only `40007`: observed
 families `03/43`, `03/44`, `04/05` and `51/14` are retained as candidates.
 Aircraft identity is extracted only from a CRC-valid `51/14` frame on the
 observed `0xEE -> App` route.
@@ -242,7 +256,12 @@ The receiver preserves raw bytes and clears current georeference values after
 capture gaps. A one-shot GPS hMSL research request is available as
 `--probe-gps-hmsl`; it is never retried automatically.
 
-Current research build: `1.5.3-research.7`. It remains bench-only
+Auto-FCC no longer writes a keepalive profile every two seconds. The FreeFCC
+Home Point Accessibility service waits on localized DJI Fly text without
+opening DUML, then sends the complete FCC profile once on a short `40009`
+lease. Manual FCC and the general one-shot DUML Lab remain available.
+
+Current research build: `1.5.3-research.8`. It remains bench-only
 until its physical RC2 gate has passed.
 
 ### Research Update Channel

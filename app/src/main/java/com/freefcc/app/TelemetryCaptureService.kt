@@ -3,6 +3,7 @@ package com.freefcc.app
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -38,6 +39,14 @@ class TelemetryCaptureService : Service() {
     private var frameCount = 0L
     private var parserErrors = 0L
     private var byteCount = 0L
+    private var recordCount = 0L
+    private var f5RecordCount = 0L
+    private var f6RecordCount = 0L
+    private var f8RecordCount = 0L
+    private var lastSourceClockMs: Long? = null
+    private var sourceStatus = "stopped"
+    private var lastByteElapsedNs = 0L
+    private var lastTickElapsedNs = 0L
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -56,7 +65,7 @@ class TelemetryCaptureService : Service() {
 
         val host = intent.getStringExtra(EXTRA_HOST).orEmpty()
         val port = intent.getIntExtra(EXTRA_PORT, DEFAULT_RELAY_PORT)
-        val capturePort = intent.getIntExtra(EXTRA_CAPTURE_PORT, DumlTransport.PORT_LED)
+        val capturePort = intent.getIntExtra(EXTRA_CAPTURE_PORT, DumlTransport.PORT_ALT_2)
         if (
             host.isBlank() ||
             port !in 1..65535 ||
@@ -86,6 +95,14 @@ class TelemetryCaptureService : Service() {
         frameCount = 0L
         parserErrors = 0L
         byteCount = 0L
+        recordCount = 0L
+        f5RecordCount = 0L
+        f6RecordCount = 0L
+        f8RecordCount = 0L
+        lastSourceClockMs = null
+        sourceStatus = "connecting"
+        lastByteElapsedNs = 0L
+        lastTickElapsedNs = 0L
 
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification("Relay starting"))
@@ -97,6 +114,7 @@ class TelemetryCaptureService : Service() {
                 sessionId = sessionId,
                 sourceMode = config.sourceMode.wireName,
                 sourcePort = config.capturePort,
+                sourceStatus = sourceStatus,
                 captureActive = false,
                 rawChunks = 0,
                 frames = 0,
@@ -120,7 +138,7 @@ class TelemetryCaptureService : Service() {
         ).also { it.start() }
 
         captureJob = scope.launch {
-            runBenchSocketCapture(config)
+            runReadOnlyCapture(config)
         }
     }
 
@@ -131,7 +149,7 @@ class TelemetryCaptureService : Service() {
         }
 
         scope.launch {
-            var hardwareLockHeld = false
+            var hardwareLease: HardwareLock.Lease? = null
             var portLease: DumlPortSessionLock.Lease? = null
             try {
                 val now = SystemClock.elapsedRealtime()
@@ -141,11 +159,11 @@ class TelemetryCaptureService : Service() {
                 }
                 lastCommandStartedElapsedMs = now
 
-                if (!HardwareLock.tryBegin()) {
+                hardwareLease = HardwareLock.tryBegin()
+                if (hardwareLease == null) {
                     sendRelayFailure(command, "busy", "Controller hardware is busy")
                     return@launch
                 }
-                hardwareLockHeld = true
 
                 if (activeConfig == null) {
                     sendRelayFailure(command, "error", "Telemetry session configuration is unavailable")
@@ -174,7 +192,7 @@ class TelemetryCaptureService : Service() {
                 sendRelayFailure(command, "error", e.message.orEmpty().ifBlank { "DUML request failed" })
             } finally {
                 portLease?.close()
-                if (hardwareLockHeld) HardwareLock.end()
+                hardwareLease?.close()
                 commandInFlight.set(false)
             }
         }
@@ -314,105 +332,166 @@ class TelemetryCaptureService : Service() {
         }
     }
 
-    private suspend fun runBenchSocketCapture(config: TelemetryConfig) {
-        val buffer = ByteArray(4096)
-        val parser = WrappedDumlFrameParser()
+    private suspend fun runReadOnlyCapture(config: TelemetryConfig) {
+        val isPublishStream = config.sourceMode == TelemetrySourceMode.Rc2PublishStream
+        val buffer = ByteArray(if (isPublishStream) 32 * 1024 else 4 * 1024)
+        val dumlParser = if (isPublishStream) null else WrappedDumlFrameParser()
+        val publishParser = if (isPublishStream) Rc2PublishStreamParser() else null
         val sourcePort = config.capturePort
         val lease = DumlPortSessionLock.tryBegin(sourcePort)
         if (lease == null) {
-            reportCaptureGap(config, "DUML port $sourcePort is already in use")
+            reportCaptureGap(config, "Controller port $sourcePort is already in use")
             return
         }
         val socket = Socket()
         captureSocket = socket
-        var gapReason = "Bench socket closed"
+        var gapReason = "Read-only source socket closed"
         try {
             socket.connect(InetSocketAddress(DUML_HOST, sourcePort), DUML_CONNECT_TIMEOUT_MS)
             socket.tcpNoDelay = true
-            socket.soTimeout = 500
+            socket.soTimeout = SOURCE_READ_TIMEOUT_MS
+            sourceStatus = "open_waiting"
+            emitSourceStatus(config, "open_waiting", "Connected read-only; waiting for source bytes")
             TelemetryStatusBus.update(
                 TelemetryStatus(
                     connecting = false,
                     captureActive = true,
                     sourcePort = sourcePort,
+                    sourceStatus = sourceStatus,
                     lastError = ""
                 )
             )
 
             val input = socket.getInputStream()
             while (currentCoroutineContext().isActive && !socket.isClosed) {
+                val beforeReadNs = SystemClock.elapsedRealtimeNanos()
                 val n = try {
                     input.read(buffer)
                 } catch (_: java.net.SocketTimeoutException) {
+                    updateSourceSilence(config, beforeReadNs)
+                    emitTickIfDue(config, beforeReadNs)
                     continue
                 }
                 if (n <= 0) break
+                val capturedElapsedNs = SystemClock.elapsedRealtimeNanos()
+                lastByteElapsedNs = capturedElapsedNs
+                if (sourceStatus != "active") {
+                    sourceStatus = "active"
+                    emitSourceStatus(config, "active", "Receiving read-only source bytes")
+                }
                 val bytes = buffer.copyOf(n)
                 val seq = ++rawSeq
                 rawChunks += 1
                 byteCount += bytes.size
 
-                relay?.enqueue(
-                    RawChunkEvent(
-                        sessionId = sessionId,
-                        seq = seq,
-                        elapsedRealtimeNs = SystemClock.elapsedRealtimeNanos(),
-                        source = config.sourceMode.wireName,
-                        direction = "controller_to_client",
-                        port = sourcePort,
-                        bytes = bytes
-                    )
-                ) ?: break
+                if (config.rawRelayEnabled) {
+                    relay?.enqueue(
+                        RawChunkEvent(
+                            sessionId = sessionId,
+                            seq = seq,
+                            elapsedRealtimeNs = capturedElapsedNs,
+                            source = config.sourceMode.wireName,
+                            direction = "controller_to_client",
+                            port = sourcePort,
+                            bytes = bytes
+                        )
+                    ) ?: break
+                }
 
-                for (result in parser.feed(bytes)) {
-                    when (result) {
-                        is DumlFrameParser.Result.Frame -> {
-                            frameCount += 1
-                            relay?.enqueue(
-                                DumlFrameEvent(
-                                    sessionId = sessionId,
-                                    rawSeq = seq,
-                                    frame = result.frame,
-                                    source = config.sourceMode.wireName,
-                                    direction = "controller_to_client",
-                                    port = sourcePort
+                if (publishParser != null) {
+                    for (result in publishParser.feed(bytes)) {
+                        when (result) {
+                            is Rc2PublishStreamParser.Result.Parsed -> {
+                                recordCount += 1
+                                lastSourceClockMs = result.record.sourceClockMs
+                                when (result.record.marker) {
+                                    0xF5 -> f5RecordCount += 1
+                                    0xF6 -> f6RecordCount += 1
+                                    0xF8 -> f8RecordCount += 1
+                                }
+                            }
+                            is Rc2PublishStreamParser.Result.Error -> {
+                                parserErrors += 1
+                                relay?.enqueue(
+                                    TelemetryErrorEvent(
+                                        sessionId = sessionId,
+                                        reason = result.error.reason,
+                                        detail = result.error.detail
+                                    )
                                 )
-                            )
+                            }
                         }
-                        is DumlFrameParser.Result.Error -> {
-                            parserErrors += 1
-                            relay?.enqueue(
-                                TelemetryErrorEvent(
-                                    sessionId = sessionId,
-                                    reason = result.error.reason,
-                                    detail = result.error.detail
+                    }
+                } else if (dumlParser != null) {
+                    for (result in dumlParser.feed(bytes)) {
+                        when (result) {
+                            is DumlFrameParser.Result.Frame -> {
+                                frameCount += 1
+                                relay?.enqueue(
+                                    DumlFrameEvent(
+                                        sessionId = sessionId,
+                                        rawSeq = seq,
+                                        elapsedRealtimeNs = capturedElapsedNs,
+                                        frame = result.frame,
+                                        source = config.sourceMode.wireName,
+                                        direction = "controller_to_client",
+                                        port = sourcePort
+                                    )
                                 )
-                            )
+                            }
+                            is DumlFrameParser.Result.Error -> {
+                                parserErrors += 1
+                                relay?.enqueue(
+                                    TelemetryErrorEvent(
+                                        sessionId = sessionId,
+                                        reason = result.error.reason,
+                                        detail = result.error.detail
+                                    )
+                                )
+                            }
                         }
                     }
                 }
 
+                emitTickIfDue(config, capturedElapsedNs)
                 TelemetryStatusBus.update(
                     TelemetryStatus(
                         running = true,
                         captureActive = true,
+                        sourceStatus = sourceStatus,
                         rawChunks = rawChunks,
                         frames = frameCount,
+                        records = recordCount,
                         parserErrors = parserErrors,
                         bytes = byteCount
                     )
                 )
             }
-            for (result in parser.finish()) {
-                if (result is DumlFrameParser.Result.Error) {
-                    parserErrors += 1
-                    relay?.enqueue(
-                        TelemetryErrorEvent(
-                            sessionId = sessionId,
-                            reason = result.error.reason,
-                            detail = result.error.detail
+            if (publishParser != null) {
+                for (result in publishParser.finish()) {
+                    if (result is Rc2PublishStreamParser.Result.Error) {
+                        parserErrors += 1
+                        relay?.enqueue(
+                            TelemetryErrorEvent(
+                                sessionId = sessionId,
+                                reason = result.error.reason,
+                                detail = result.error.detail
+                            )
                         )
-                    )
+                    }
+                }
+            } else if (dumlParser != null) {
+                for (result in dumlParser.finish()) {
+                    if (result is DumlFrameParser.Result.Error) {
+                        parserErrors += 1
+                        relay?.enqueue(
+                            TelemetryErrorEvent(
+                                sessionId = sessionId,
+                                reason = result.error.reason,
+                                detail = result.error.detail
+                            )
+                        )
+                    }
                 }
             }
         } catch (e: IOException) {
@@ -432,7 +511,98 @@ class TelemetryCaptureService : Service() {
         reportCaptureGap(config, gapReason)
     }
 
+    private fun updateSourceSilence(config: TelemetryConfig, nowNs: Long) {
+        val ageMs = lastByteAgeMs(nowNs)
+        val nextStatus = when {
+            lastByteElapsedNs == 0L -> "open_silent"
+            ageMs != null && ageMs >= SOURCE_GAP_AFTER_MS -> "gap"
+            else -> sourceStatus
+        }
+        if (nextStatus == sourceStatus) return
+        sourceStatus = nextStatus
+        val detail = if (nextStatus == "open_silent") {
+            "Socket is open but the source has not published bytes"
+        } else {
+            "No source bytes for ${ageMs ?: 0} ms"
+        }
+        emitSourceStatus(config, nextStatus, detail)
+        if (nextStatus == "gap") {
+            relay?.enqueue(
+                TelemetryUnavailableEvent(
+                    sessionId = sessionId,
+                    sourceId = config.sourceId,
+                    reason = detail
+                )
+            )
+        }
+        TelemetryStatusBus.update(
+            TelemetryStatus(sourceStatus = nextStatus, lastError = "")
+        )
+    }
+
+    private fun emitTickIfDue(config: TelemetryConfig, nowNs: Long) {
+        val intervalNs = config.sampleIntervalMs * 1_000_000L
+        if (lastTickElapsedNs != 0L && nowNs - lastTickElapsedNs < intervalNs) return
+        lastTickElapsedNs = nowNs
+        val ageMs = lastByteAgeMs(nowNs)
+        relay?.enqueue(
+            TelemetryTickEvent(
+                sessionId = sessionId,
+                source = config.sourceMode.wireName,
+                port = config.capturePort,
+                elapsedRealtimeNs = nowNs,
+                sourceStatus = sourceStatus,
+                lastByteAgeMs = ageMs,
+                sourceClockMs = lastSourceClockMs
+            )
+        )
+        if (config.sourceMode == TelemetrySourceMode.Rc2PublishStream) {
+            relay?.enqueue(
+                Rc2RecordStatsEvent(
+                    sessionId = sessionId,
+                    elapsedRealtimeNs = nowNs,
+                    source = config.sourceMode.wireName,
+                    port = config.capturePort,
+                    totalRecords = recordCount,
+                    f5Records = f5RecordCount,
+                    f6Records = f6RecordCount,
+                    f8Records = f8RecordCount,
+                    sourceClockMs = lastSourceClockMs
+                )
+            )
+        }
+    }
+
+    private fun emitSourceStatus(config: TelemetryConfig, status: String, detail: String) {
+        val nowNs = SystemClock.elapsedRealtimeNanos()
+        relay?.enqueue(
+            TelemetrySourceStatusEvent(
+                sessionId = sessionId,
+                source = config.sourceMode.wireName,
+                port = config.capturePort,
+                status = status,
+                detail = detail,
+                elapsedRealtimeNs = nowNs,
+                lastByteAgeMs = lastByteAgeMs(nowNs)
+            )
+        )
+        updateNotification(
+            when (status) {
+                "active" -> "Metadata active on ${config.capturePort}"
+                "open_silent" -> "Port ${config.capturePort} open; waiting for data"
+                "gap" -> "Metadata gap on ${config.capturePort}"
+                "unavailable" -> "Metadata unavailable"
+                else -> detail
+            }
+        )
+    }
+
+    private fun lastByteAgeMs(nowNs: Long): Long? =
+        if (lastByteElapsedNs == 0L) null else ((nowNs - lastByteElapsedNs) / 1_000_000L)
+
     private fun reportCaptureGap(config: TelemetryConfig, reason: String) {
+        sourceStatus = "unavailable"
+        emitSourceStatus(config, sourceStatus, reason)
         relay?.enqueue(
             TelemetryErrorEvent(
                 sessionId = sessionId,
@@ -452,6 +622,7 @@ class TelemetryCaptureService : Service() {
                 running = true,
                 connecting = false,
                 captureActive = false,
+                sourceStatus = sourceStatus,
                 lastError = "$reason; metadata unavailable, restart relay explicitly"
             )
         )
@@ -464,6 +635,7 @@ class TelemetryCaptureService : Service() {
                 relayConnected = false,
                 connecting = false,
                 captureActive = false,
+                sourceStatus = "unavailable",
                 lastError = reason
             )
         )
@@ -484,6 +656,7 @@ class TelemetryCaptureService : Service() {
                 connecting = false,
                 relayConnected = false,
                 captureActive = false,
+                sourceStatus = "stopped",
                 queueDepth = 0
             )
         )
@@ -512,12 +685,28 @@ class TelemetryCaptureService : Service() {
         } else {
             Notification.Builder(this)
         }
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            openIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
         return builder
             .setContentTitle("Telemetry Research")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setContentIntent(pendingIntent)
             .build()
+    }
+
+    private fun updateNotification(text: String) {
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, createNotification(text))
     }
 
     override fun onDestroy() {
@@ -533,6 +722,8 @@ class TelemetryCaptureService : Service() {
         private const val NOTIFICATION_ID = 9020
         private const val DUML_HOST = "127.0.0.1"
         private const val DUML_CONNECT_TIMEOUT_MS = 2_000
+        private const val SOURCE_READ_TIMEOUT_MS = 250
+        private const val SOURCE_GAP_AFTER_MS = 2_000L
         private const val MIN_COMMAND_INTERVAL_MS = 500L
         private const val DEFAULT_RELAY_PORT = 8765
 

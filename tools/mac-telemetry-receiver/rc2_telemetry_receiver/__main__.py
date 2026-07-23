@@ -12,6 +12,7 @@ from .receiver import (
     request_remote_duml,
     request_remote_gps_hmsl,
     request_remote_probe,
+    replay_session,
 )
 from .telemetry import analyze_session
 
@@ -24,6 +25,7 @@ def main() -> None:
     parser.add_argument("--adb-pcap", action="store_true", help="Run adb exec-out tcpdump and decode passive lo:40009 PCAP")
     parser.add_argument("--adb", default="adb", help="adb executable for --adb-pcap")
     parser.add_argument("--analyze", help="Analyze an existing session.ndjson and print candidate fields")
+    parser.add_argument("--replay", help="Replay source events and regenerate derived metadata")
     parser.add_argument("--probe-fc-osd", action="store_true", help="Request one allowlisted 03/43 probe from the connected RC2")
     parser.add_argument("--probe-gps-hmsl", action="store_true", help="Request one read-only 03/57 GPS hMSL sample")
     parser.add_argument("--probe-aircraft-serial", action="store_true", help="Request one read-only 00/51 aircraft serial sample")
@@ -68,6 +70,9 @@ def main() -> None:
         print(json.dumps(request_remote_aircraft_serial(args.control), indent=2))
     elif args.probe_fc_osd:
         print(json.dumps(request_remote_probe(args.control), indent=2))
+    elif args.replay:
+        writer = replay_session(Path(args.replay).expanduser().resolve(), out_root)
+        print(writer.session_dir)
     elif args.analyze:
         print(json.dumps(analyze_session(Path(args.analyze).expanduser().resolve()), indent=2))
     elif args.adb_pcap:

@@ -13,6 +13,7 @@ import java.net.Socket
 import java.util.Base64
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import org.json.JSONObject
 
 sealed interface TelemetryRelayCommand {
@@ -45,7 +46,10 @@ class TelemetryRelayClient(
     private val onCommand: (TelemetryRelayCommand) -> Unit,
     private val onFatal: (String) -> Unit
 ) {
-    private val queue = ArrayBlockingQueue<TelemetryEvent>(MAX_QUEUE_EVENTS)
+    private data class QueuedEvent(val event: TelemetryEvent, val bytes: Long)
+
+    private val queue = ArrayBlockingQueue<QueuedEvent>(MAX_QUEUE_EVENTS)
+    private val queuedBytes = AtomicLong(0)
     private var writerJob: Job? = null
 
     fun start() {
@@ -93,8 +97,9 @@ class TelemetryRelayClient(
                         }
                     }
                     while (isActive && !connectedSocket.isClosed) {
-                        val event = queue.poll(500, TimeUnit.MILLISECONDS) ?: continue
-                        writeLine(writer, event)
+                        val queued = queue.poll(500, TimeUnit.MILLISECONDS) ?: continue
+                        queuedBytes.addAndGet(-queued.bytes)
+                        writeLine(writer, queued.event)
                         onStatus(TelemetryStatus(relayConnected = true, queueDepth = queue.size))
                     }
                     readerJob.cancel()
@@ -113,11 +118,20 @@ class TelemetryRelayClient(
         writerJob?.cancel()
         writerJob = null
         queue.clear()
+        queuedBytes.set(0)
     }
 
     fun enqueue(event: TelemetryEvent): Boolean {
-        val accepted = queue.offer(event)
+        val bytes = event.toJsonLine().toByteArray(Charsets.UTF_8).size.toLong() + 1L
+        val totalBytes = queuedBytes.addAndGet(bytes)
+        if (totalBytes > MAX_QUEUE_BYTES) {
+            queuedBytes.addAndGet(-bytes)
+            onFatal("Telemetry relay byte queue full; stopping to avoid stale metadata")
+            return false
+        }
+        val accepted = queue.offer(QueuedEvent(event, bytes))
         if (!accepted) {
+            queuedBytes.addAndGet(-bytes)
             onFatal("Telemetry relay queue full; stopping to avoid stale metadata")
         } else {
             onStatus(TelemetryStatus(queueDepth = queue.size))
@@ -214,6 +228,7 @@ class TelemetryRelayClient(
     companion object {
         private const val CONNECT_TIMEOUT_MS = 2_000
         private const val MAX_QUEUE_EVENTS = 512
+        private const val MAX_QUEUE_BYTES = 8L * 1024 * 1024
         private const val ALLOWED_PROBE = "fc_osd_03_43_once"
         private const val MAX_REMOTE_PAYLOAD_BYTES = 512
         val RESEARCH_DUML_PORTS = setOf(40009, 40007, 8901, 8902, 8903, 8904)
@@ -227,9 +242,11 @@ data class TelemetryStatus(
     val sessionId: String? = null,
     val sourceMode: String? = null,
     val sourcePort: Int? = null,
+    val sourceStatus: String? = null,
     val captureActive: Boolean? = null,
     val rawChunks: Long? = null,
     val frames: Long? = null,
+    val records: Long? = null,
     val parserErrors: Long? = null,
     val bytes: Long? = null,
     val queueDepth: Int? = null,
@@ -242,10 +259,12 @@ data class TelemetryRuntimeState(
     val relayConnected: Boolean = false,
     val sessionId: String = "",
     val sourceMode: String = "",
-    val sourcePort: Int = DumlTransport.PORT_LED,
+    val sourcePort: Int = DumlTransport.PORT_ALT_2,
+    val sourceStatus: String = "stopped",
     val captureActive: Boolean = false,
     val rawChunks: Long = 0,
     val frames: Long = 0,
+    val records: Long = 0,
     val parserErrors: Long = 0,
     val bytes: Long = 0,
     val queueDepth: Int = 0,
@@ -258,9 +277,11 @@ data class TelemetryRuntimeState(
         sessionId = status.sessionId ?: sessionId,
         sourceMode = status.sourceMode ?: sourceMode,
         sourcePort = status.sourcePort ?: sourcePort,
+        sourceStatus = status.sourceStatus ?: sourceStatus,
         captureActive = status.captureActive ?: captureActive,
         rawChunks = status.rawChunks ?: rawChunks,
         frames = status.frames ?: frames,
+        records = status.records ?: records,
         parserErrors = status.parserErrors ?: parserErrors,
         bytes = status.bytes ?: bytes,
         queueDepth = status.queueDepth ?: queueDepth,
