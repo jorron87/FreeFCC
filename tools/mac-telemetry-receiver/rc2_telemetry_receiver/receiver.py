@@ -201,11 +201,13 @@ class SessionWriter:
         if event.get("type") == "RAW_CHUNK":
             seq = int(event.get("seq", 0))
             data = base64.b64decode(str(event.get("bytes_b64", "")))
+            direction = str(event.get("direction") or "unknown")
             assert self.raw_dir is not None
-            (self.raw_dir / f"raw-{seq:08d}.bin").write_bytes(data)
-            assert self.raw_stream_path is not None
-            with self.raw_stream_path.open("ab") as stream:
-                stream.write(data)
+            (self.raw_dir / f"raw-{seq:08d}-{direction}.bin").write_bytes(data)
+            if direction != "client_to_controller":
+                assert self.raw_stream_path is not None
+                with self.raw_stream_path.open("ab") as stream:
+                    stream.write(data)
 
     def _is_publish_stream(self, event: dict[str, Any]) -> bool:
         return (
@@ -261,9 +263,10 @@ class SessionWriter:
         elif event_type == "RAW_CHUNK":
             self.stats.raw_chunks += 1
             self.stats.bytes += len(base64.b64decode(str(event.get("bytes_b64", ""))))
-            self.stats.capture_state = "active"
-            if self.stats.last_error.startswith("capture_gap"):
-                self.stats.last_error = ""
+            if event.get("direction") != "client_to_controller":
+                self.stats.capture_state = "active"
+                if self.stats.last_error.startswith("capture_gap"):
+                    self.stats.last_error = ""
             self.stats.latest_elapsed_realtime_ns = int(
                 event.get("elapsed_realtime_ns", self.stats.latest_elapsed_realtime_ns) or 0
             )

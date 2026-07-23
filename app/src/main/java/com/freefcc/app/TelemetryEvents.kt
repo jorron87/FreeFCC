@@ -11,14 +11,19 @@ import java.util.zip.CRC32
 
 enum class TelemetrySourceMode(val wireName: String) {
     Rc2PublishStream("rc2_publish_8902"),
+    BenchWrappedPrimed("bench_wrapped_primed"),
     BenchWrappedSocket("bench_wrapped_socket"),
     BenchDirectSocket("bench_direct_socket");
 
     companion object {
-        fun forPort(port: Int): TelemetrySourceMode =
+        fun forPort(port: Int, primerEnabled: Boolean = false): TelemetrySourceMode =
             when (port) {
                 DumlTransport.PORT_ALT_2 -> Rc2PublishStream
-                DumlTransport.PORT_LED -> BenchWrappedSocket
+                DumlTransport.PORT_LED -> if (primerEnabled) {
+                    BenchWrappedPrimed
+                } else {
+                    BenchWrappedSocket
+                }
                 else -> BenchDirectSocket
             }
     }
@@ -29,7 +34,8 @@ data class TelemetryConfig(
     val port: Int,
     val sourceId: String,
     val capturePort: Int = DumlTransport.PORT_ALT_2,
-    val sourceMode: TelemetrySourceMode = TelemetrySourceMode.forPort(capturePort),
+    val primerEnabled: Boolean = false,
+    val sourceMode: TelemetrySourceMode = TelemetrySourceMode.forPort(capturePort, primerEnabled),
     val rawRelayEnabled: Boolean = true,
     val sampleIntervalMs: Long = 1_000,
     val controllerFirmware: String = "",
@@ -56,11 +62,12 @@ data class TelemetryHelloEvent(
         "app_version" to appVersion,
         "source_mode" to config.sourceMode.wireName,
         "source_port" to config.capturePort,
-        "source_policy" to if (config.sourceMode == TelemetrySourceMode.Rc2PublishStream) {
-            "persistent_read_only"
-        } else {
-            "explicit_single_connection"
+        "source_policy" to when (config.sourceMode) {
+            TelemetrySourceMode.Rc2PublishStream -> "persistent_read_only"
+            TelemetrySourceMode.BenchWrappedPrimed -> "same_socket_1hz_03_44_no_reconnect"
+            else -> "explicit_single_connection"
         },
+        "primer_enabled" to config.primerEnabled,
         "raw_relay_enabled" to config.rawRelayEnabled,
         "sample_interval_ms" to config.sampleIntervalMs,
         "source_id" to config.sourceId,

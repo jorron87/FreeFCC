@@ -30,6 +30,7 @@ from rc2_telemetry_receiver.receiver import (
     error_event,
     extract_serial_candidate,
     handle_payload_stream,
+    raw_chunk_event,
     replay_session,
 )
 from rc2_telemetry_receiver.telemetry import analyze_session, decode_candidate
@@ -113,6 +114,28 @@ class Publish8902ParserTest(unittest.TestCase):
 
 
 class SessionWriterTest(unittest.TestCase):
+    def test_outbound_primer_is_evidence_not_inbound_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = SessionWriter(Path(tmp))
+            writer.handle_event(
+                raw_chunk_event(
+                    session_id="primed-session",
+                    seq=1,
+                    source="bench_wrapped_primed",
+                    direction="client_to_controller",
+                    port=40007,
+                    data=b"primer",
+                )
+            )
+
+            assert writer.session_dir is not None
+            self.assertFalse((writer.session_dir / "raw-stream.bin").exists())
+            self.assertEqual("unknown", writer.stats.capture_state)
+            self.assertEqual(
+                b"primer",
+                next((writer.session_dir / "raw").glob("*client_to_controller.bin")).read_bytes(),
+            )
+
     def test_8902_raw_stream_produces_records_readiness_and_one_hz_sample(self) -> None:
         record = bytearray(_publish_record(0xF5, 71, 1234))
         struct.pack_into("<I", record, 48, 0x00815100)

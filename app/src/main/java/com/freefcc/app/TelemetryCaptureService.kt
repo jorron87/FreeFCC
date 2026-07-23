@@ -69,7 +69,9 @@ class TelemetryCaptureService : Service() {
         if (
             host.isBlank() ||
             port !in 1..65535 ||
-            capturePort !in TelemetryRelayClient.RESEARCH_DUML_PORTS
+            capturePort !in TelemetryRelayClient.RESEARCH_DUML_PORTS ||
+            (intent.getBooleanExtra(EXTRA_PRIMER_ENABLED, false) &&
+                capturePort != DumlTransport.PORT_LED)
         ) {
             TelemetryStatusBus.update(
                 TelemetryStatus(running = false, lastError = "Invalid Mac endpoint or DUML capture port")
@@ -83,6 +85,7 @@ class TelemetryCaptureService : Service() {
             port = port,
             sourceId = intent.getStringExtra(EXTRA_SOURCE_ID).orEmpty().ifBlank { "rc2-bench" },
             capturePort = capturePort,
+            primerEnabled = intent.getBooleanExtra(EXTRA_PRIMER_ENABLED, false),
             controllerFirmware = intent.getStringExtra(EXTRA_CONTROLLER_FIRMWARE).orEmpty(),
             djiFlyVersion = intent.getStringExtra(EXTRA_DJI_FLY_VERSION).orEmpty(),
             aircraftModel = intent.getStringExtra(EXTRA_AIRCRAFT_MODEL).orEmpty(),
@@ -350,8 +353,22 @@ class TelemetryCaptureService : Service() {
             socket.connect(InetSocketAddress(DUML_HOST, sourcePort), DUML_CONNECT_TIMEOUT_MS)
             socket.tcpNoDelay = true
             socket.soTimeout = SOURCE_READ_TIMEOUT_MS
-            sourceStatus = "open_waiting"
-            emitSourceStatus(config, "open_waiting", "Connected read-only; waiting for source bytes")
+            val primer = if (config.primerEnabled) SameSocketTelemetryPrimer() else null
+            val output = if (primer != null) socket.getOutputStream() else null
+            var nextPrimerElapsedNs = 0L
+            if (primer != null && output != null) {
+                sendPrimer(config, primer, output, SystemClock.elapsedRealtimeNanos())
+                nextPrimerElapsedNs = SystemClock.elapsedRealtimeNanos() + PRIMER_INTERVAL_NS
+                sourceStatus = "primed_waiting"
+                emitSourceStatus(
+                    config,
+                    sourceStatus,
+                    "Connected; 1 Hz 03/44 refresh active on the same socket"
+                )
+            } else {
+                sourceStatus = "open_waiting"
+                emitSourceStatus(config, "open_waiting", "Connected read-only; waiting for source bytes")
+            }
             TelemetryStatusBus.update(
                 TelemetryStatus(
                     connecting = false,
@@ -365,6 +382,10 @@ class TelemetryCaptureService : Service() {
             val input = socket.getInputStream()
             while (currentCoroutineContext().isActive && !socket.isClosed) {
                 val beforeReadNs = SystemClock.elapsedRealtimeNanos()
+                if (primer != null && output != null && beforeReadNs >= nextPrimerElapsedNs) {
+                    sendPrimer(config, primer, output, beforeReadNs)
+                    nextPrimerElapsedNs = beforeReadNs + PRIMER_INTERVAL_NS
+                }
                 val n = try {
                     input.read(buffer)
                 } catch (_: java.net.SocketTimeoutException) {
@@ -537,6 +558,29 @@ class TelemetryCaptureService : Service() {
         }
         TelemetryStatusBus.update(
             TelemetryStatus(sourceStatus = nextStatus, lastError = "")
+        )
+    }
+
+    private fun sendPrimer(
+        config: TelemetryConfig,
+        primer: SameSocketTelemetryPrimer,
+        output: java.io.OutputStream,
+        elapsedNs: Long
+    ) {
+        val bytes = primer.next()
+        output.write(bytes)
+        output.flush()
+        val seq = ++rawSeq
+        relay?.enqueue(
+            RawChunkEvent(
+                sessionId = sessionId,
+                seq = seq,
+                elapsedRealtimeNs = elapsedNs,
+                source = config.sourceMode.wireName,
+                direction = "client_to_controller",
+                port = config.capturePort,
+                bytes = bytes
+            )
         )
     }
 
@@ -724,6 +768,7 @@ class TelemetryCaptureService : Service() {
         private const val DUML_CONNECT_TIMEOUT_MS = 2_000
         private const val SOURCE_READ_TIMEOUT_MS = 250
         private const val SOURCE_GAP_AFTER_MS = 2_000L
+        private const val PRIMER_INTERVAL_NS = 1_000_000_000L
         private const val MIN_COMMAND_INTERVAL_MS = 500L
         private const val DEFAULT_RELAY_PORT = 8765
 
@@ -733,6 +778,7 @@ class TelemetryCaptureService : Service() {
         private const val EXTRA_PORT = "port"
         private const val EXTRA_SOURCE_ID = "source_id"
         private const val EXTRA_CAPTURE_PORT = "capture_port"
+        private const val EXTRA_PRIMER_ENABLED = "primer_enabled"
         private const val EXTRA_CONTROLLER_FIRMWARE = "controller_firmware"
         private const val EXTRA_DJI_FLY_VERSION = "dji_fly_version"
         private const val EXTRA_AIRCRAFT_MODEL = "aircraft_model"
@@ -745,6 +791,7 @@ class TelemetryCaptureService : Service() {
                 putExtra(EXTRA_PORT, config.port)
                 putExtra(EXTRA_SOURCE_ID, config.sourceId)
                 putExtra(EXTRA_CAPTURE_PORT, config.capturePort)
+                putExtra(EXTRA_PRIMER_ENABLED, config.primerEnabled)
                 putExtra(EXTRA_CONTROLLER_FIRMWARE, config.controllerFirmware)
                 putExtra(EXTRA_DJI_FLY_VERSION, config.djiFlyVersion)
                 putExtra(EXTRA_AIRCRAFT_MODEL, config.aircraftModel)

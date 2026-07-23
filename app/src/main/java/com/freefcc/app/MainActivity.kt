@@ -226,7 +226,7 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
 
             Spacer(Modifier.height(16.dp))
             BodyText(
-                "Read-only capture with one explicit source connection. Port 8902 is passive and persistent; 40007/40009 remain bench-only single connections with no automatic reconnect.",
+                "One explicit source connection. Primed 40007 sends one 03/44 refresh per second on the same socket; EOF and write failures stop without reconnect.",
                 Amber
             )
 
@@ -277,17 +277,18 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
             Spacer(Modifier.height(8.dp))
             SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                 listOf(
-                    "8902 Passive" to "8902",
-                    "40009 Direct" to "40009",
-                    "40007 Snapshot" to "40007"
+                    Triple("8902 Passive", 8902, false),
+                    Triple("40007 Primed", 40007, true),
+                    Triple("40007 Snapshot", 40007, false)
                 ).forEachIndexed { index, choice ->
                     SegmentedButton(
-                        selected = state.telemetryCapturePort == choice.second,
-                        onClick = { viewModel.updateTelemetryCapturePort(choice.second) },
+                        selected = state.telemetryCapturePort == choice.second.toString() &&
+                            state.telemetryPrimerEnabled == choice.third,
+                        onClick = { viewModel.selectTelemetrySource(choice.second, choice.third) },
                         shape = SegmentedButtonDefaults.itemShape(index, 3),
                         enabled = !runtime.running
                     ) {
-                        Text(choice.first, fontSize = 12.sp)
+                        Text(choice.first, fontSize = 11.sp)
                     }
                 }
             }
@@ -300,7 +301,14 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 enabled = !runtime.running
             )
             Spacer(Modifier.height(8.dp))
-            BodyText("8902 is preferred. 40007 never polls or reconnects automatically.", TextDim)
+            BodyText(
+                if (state.telemetryPrimerEnabled) {
+                    "ACTIVE BENCH: 1 Hz 03/44, same socket, no reconnect."
+                } else {
+                    "Passive source; no writes or automatic reconnect."
+                },
+                if (state.telemetryPrimerEnabled) Amber else TextDim
+            )
             Spacer(Modifier.height(18.dp))
             if (runtime.running) {
                 GlowButton("Stop Relay", Red) { viewModel.stopTelemetryRelay() }

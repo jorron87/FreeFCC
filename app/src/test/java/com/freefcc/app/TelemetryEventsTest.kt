@@ -103,6 +103,26 @@ class TelemetryEventsTest {
     }
 
     @Test
+    fun `hello records same socket primer policy`() {
+        val line = TelemetryHelloEvent(
+            sessionId = "session-3",
+            config = TelemetryConfig(
+                host = "192.168.5.99",
+                port = 8765,
+                sourceId = "neo2",
+                capturePort = 40007,
+                primerEnabled = true
+            ),
+            appVersion = "test",
+            controllerModel = "rc331"
+        ).toJsonLine()
+
+        assertTrue(line.contains("\"source_mode\":\"bench_wrapped_primed\""))
+        assertTrue(line.contains("\"source_policy\":\"same_socket_1hz_03_44_no_reconnect\""))
+        assertTrue(line.contains("\"primer_enabled\":true"))
+    }
+
+    @Test
     fun `telemetry tick preserves source freshness`() {
         val line = TelemetryTickEvent(
             sessionId = "session-2",

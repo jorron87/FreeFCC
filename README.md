@@ -261,7 +261,13 @@ Home Point Accessibility service waits on localized DJI Fly text without
 opening DUML, then sends the complete FCC profile once on a short `40009`
 lease. Manual FCC and the general one-shot DUML Lab remain available.
 
-Current research build: `1.5.3-research.8`. It remains bench-only
+`research.9` adds an explicit `40007 Primed` source based on Skylab's tested
+broker-window mechanism. It opens one socket, sends a fresh CRC-valid `03/44`
+request once per second on that same connection, and never reconnects after
+EOF or write failure. Outgoing primers are retained as TX evidence and never
+treated as incoming telemetry.
+
+Current research build: `1.5.3-research.9`. It remains bench-only
 until its physical RC2 gate has passed.
 
 ### Research Update Channel

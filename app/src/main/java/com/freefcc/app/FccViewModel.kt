@@ -57,6 +57,7 @@ data class AppState(
     val telemetryHost: String = "",
     val telemetryPort: String = "8765",
     val telemetryCapturePort: String = "8902",
+    val telemetryPrimerEnabled: Boolean = false,
     val telemetrySourceId: String = "rc2-bench",
     val telemetryControllerFirmware: String = "",
     val telemetryDjiFlyVersion: String = "",
@@ -81,7 +82,7 @@ data class AppState(
 class FccViewModel(private val app: Application) : AndroidViewModel(app) {
 
     companion object {
-        const val APP_VERSION = "1.5.3-research.8"
+        const val APP_VERSION = "1.5.3-research.9"
 
         /**
          * Aircraft model codes known to support DJI Cellular Dongle 2 / 4G.
@@ -148,6 +149,8 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
                 telemetryHost = prefs.getString("telemetry_host", "").orEmpty(),
                 telemetryPort = prefs.getString("telemetry_port", "8765").orEmpty().ifBlank { "8765" },
                 telemetryCapturePort = capturePort,
+                telemetryPrimerEnabled = prefs.getBoolean("telemetry_primer_enabled", false) &&
+                    capturePort == DumlTransport.PORT_LED.toString(),
                 telemetrySourceId = prefs.getString("telemetry_source_id", "rc2-bench").orEmpty().ifBlank { "rc2-bench" },
                 telemetryControllerFirmware = prefs.getString("telemetry_controller_firmware", "").orEmpty(),
                 telemetryDjiFlyVersion = prefs.getString("telemetry_dji_fly_version", "").orEmpty(),
@@ -215,8 +218,32 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
 
     fun updateTelemetryCapturePort(value: String) {
         val cleaned = value.filter { it.isDigit() }.take(5)
-        prefs.edit().putString("telemetry_capture_port", cleaned).apply()
-        update { copy(telemetryCapturePort = cleaned) }
+        val primerEnabled = cleaned == DumlTransport.PORT_LED.toString() &&
+            _state.value.telemetryPrimerEnabled
+        prefs.edit()
+            .putString("telemetry_capture_port", cleaned)
+            .putBoolean("telemetry_primer_enabled", primerEnabled)
+            .apply()
+        update {
+            copy(
+                telemetryCapturePort = cleaned,
+                telemetryPrimerEnabled = primerEnabled
+            )
+        }
+    }
+
+    fun selectTelemetrySource(port: Int, primerEnabled: Boolean) {
+        val usePrimer = port == DumlTransport.PORT_LED && primerEnabled
+        prefs.edit()
+            .putString("telemetry_capture_port", port.toString())
+            .putBoolean("telemetry_primer_enabled", usePrimer)
+            .apply()
+        update {
+            copy(
+                telemetryCapturePort = port.toString(),
+                telemetryPrimerEnabled = usePrimer
+            )
+        }
     }
 
     fun updateTelemetrySourceId(value: String) {
@@ -276,6 +303,7 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
             port = port,
             sourceId = current.telemetrySourceId.ifBlank { "rc2-bench" },
             capturePort = capturePort,
+            primerEnabled = current.telemetryPrimerEnabled,
             controllerFirmware = current.telemetryControllerFirmware,
             djiFlyVersion = current.telemetryDjiFlyVersion,
             aircraftModel = current.telemetryAircraftModel,
