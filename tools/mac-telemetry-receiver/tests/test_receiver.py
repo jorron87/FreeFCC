@@ -403,6 +403,41 @@ class SessionWriterTest(unittest.TestCase):
 
 
 class RelayControlHubTest(unittest.TestCase):
+    def test_stale_disconnect_does_not_detach_newer_connection(self) -> None:
+        stale_app, stale_mac = socket.socketpair()
+        current_app, current_mac = socket.socketpair()
+        hub = RelayControlHub()
+        hub.attach(stale_app)
+        hub.attach(current_app)
+        hub.detach(stale_app)
+        received: dict[str, object] = {}
+
+        def respond() -> None:
+            with current_mac.makefile("r", encoding="utf-8") as reader:
+                command = json.loads(reader.readline())
+                received.update(command)
+                hub.handle_event(
+                    {
+                        "type": "PROBE_RESULT",
+                        "request_id": command["request_id"],
+                        "status": "ok",
+                    }
+                )
+
+        thread = threading.Thread(target=respond)
+        thread.start()
+        try:
+            result = hub.request_probe(timeout=1.0)
+        finally:
+            thread.join(timeout=1.0)
+            stale_app.close()
+            stale_mac.close()
+            current_app.close()
+            current_mac.close()
+
+        self.assertEqual("PROBE_REQUEST", received["type"])
+        self.assertEqual("ok", result["status"])
+
     def test_allowlisted_probe_is_correlated_with_result(self) -> None:
         app_side, mac_side = socket.socketpair()
         hub = RelayControlHub()

@@ -586,6 +586,7 @@ def listen(bind: str, out_root: Path, control_bind: str = "127.0.0.1:8766") -> N
     port = int(port_text)
     out_root.mkdir(parents=True, exist_ok=True)
     writers: dict[str, SessionWriter] = {}
+    writers_lock = threading.Lock()
     control_hub = RelayControlHub()
     threading.Thread(
         target=_serve_control,
@@ -597,35 +598,64 @@ def listen(bind: str, out_root: Path, control_bind: str = "127.0.0.1:8766") -> N
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((host, port))
-        server.listen(1)
+        server.listen(4)
         print(f"listening on {host}:{port}", flush=True)
         while True:
             conn, addr = server.accept()
             print(f"client connected from {addr[0]}:{addr[1]}", flush=True)
             control_hub.attach(conn)
-            try:
-                with conn, conn.makefile("r", encoding="utf-8", newline="\n") as handle:
-                    for line in handle:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            event = json.loads(line)
-                        except json.JSONDecodeError as exc:
-                            event = error_event(session_id="invalid-json", reason="json_decode", detail=str(exc))
-                        session_id = str(event.get("session_id") or "unknown")
-                        writer = writers.get(session_id)
-                        if writer is None:
-                            writer = SessionWriter(out_root)
-                            writers[session_id] = writer
-                        writer.handle_event(event)
-                        control_hub.handle_event(event)
-                        _print_status(writer.stats)
-            except OSError as exc:
-                print(f"client socket closed: {exc}", flush=True)
-            finally:
-                control_hub.detach(conn)
-            print("client disconnected", flush=True)
+            _configure_client_socket(conn)
+            threading.Thread(
+                target=_handle_relay_client,
+                args=(conn, writers, writers_lock, control_hub, out_root),
+                daemon=True,
+                name=f"rc2-relay-{addr[0]}:{addr[1]}",
+            ).start()
+
+
+def _configure_client_socket(conn: socket.socket) -> None:
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for option_name in ("TCP_KEEPALIVE", "TCP_KEEPIDLE"):
+        option = getattr(socket, option_name, None)
+        if option is None:
+            continue
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, option, 15)
+        except OSError:
+            pass
+
+
+def _handle_relay_client(
+    conn: socket.socket,
+    writers: dict[str, SessionWriter],
+    writers_lock: threading.Lock,
+    control_hub: RelayControlHub,
+    out_root: Path,
+) -> None:
+    try:
+        with conn, conn.makefile("r", encoding="utf-8", newline="\n") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    event = error_event(session_id="invalid-json", reason="json_decode", detail=str(exc))
+                session_id = str(event.get("session_id") or "unknown")
+                with writers_lock:
+                    writer = writers.get(session_id)
+                    if writer is None:
+                        writer = SessionWriter(out_root)
+                        writers[session_id] = writer
+                    writer.handle_event(event)
+                    _print_status(writer.stats)
+                control_hub.handle_event(event)
+    except OSError as exc:
+        print(f"client socket closed: {exc}", flush=True)
+    finally:
+        control_hub.detach(conn)
+    print("client disconnected", flush=True)
 
 
 def _serve_control(bind: str, hub: RelayControlHub) -> None:
