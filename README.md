@@ -180,7 +180,7 @@ Each command is a small binary packet with a magic byte (`0x55`), a header with 
 
 This fork adds a separate Telemetry tab for raw metadata research. It can stream `RAW_CHUNK` and validated `DUML_FRAME` NDJSON records to a local Mac on port `8765`.
 
-`1.5.3-research.8` defaults to the read-only RC2 publish endpoint
+`1.5.3-research.10` defaults to the read-only RC2 publish endpoint
 `127.0.0.1:8902`. One socket remains open for the explicit session, the app
 sends no bytes to that endpoint, and a `TELEMETRY_TICK` produces one Mac-side
 `GEOREFERENCE_SAMPLE` per second. A connected but silent endpoint is reported
@@ -195,22 +195,33 @@ explicit bench connection.
 Port `8902` uses a bounded parser for `F5 64`, `F6 64`, and `F8 64`
 length-delimited records and their 32-bit controller clock. It is not DUML.
 Raw bytes are retained as chunk artifacts and `raw-stream.bin` for replay.
-Port `40007` must never be polled or reopened periodically.
+Port `40007` must never be reopened periodically. The active keepalive source
+uses only its one existing socket and stops terminally on EOF or write failure.
 
-Each source start opens exactly one read-only connection. EOF or I/O failure
-records a capture gap, clears live metadata, and requires explicit restart.
+Each source start opens exactly one connection. Passive sources write no source
+bytes; `40007 Keepalive` is explicitly active. EOF or I/O failure records a
+capture gap, clears live metadata, and requires explicit restart.
 The ongoing Android telemetry notification remains active after switching to
 DJI Fly and reports `active`, `open_silent`, gap, or unavailable.
 
-The receiver also exposes a Mac-local control socket on `127.0.0.1:8766`. It
-can request the predefined one-shot `03/43` candidate decoder or send one
-structured DUML frame with caller-selected sender, destination, command type,
-command set, command ID, payload, response window and localhost port. Commands
-are correlated by `request_id`, recorded as `PROBE_RESULT` or `DUML_RESULT`,
-limited to a 512-byte payload and the known ports above, and never retried
-automatically. The selected command port is pinned and never replaced by port
-auto-detection. A command targeting the active capture port is rejected; a
-command on another port can run without tearing down capture.
+The receiver also exposes a control socket forced to Mac loopback on
+`127.0.0.1:8766`. It can request the predefined one-shot `03/43` candidate
+decoder, send one structured DUML frame, or forward a `duml-lab/v1` recipe.
+Every request is correlated by `request_id` and persisted in session NDJSON.
+
+DUML Lab recipes can select any controller-local TCP port `1..65535`, build
+direct or wrapped DUML with fresh sequence/CRCs, send exact raw bytes, and
+compose explicit `connect`, `write_duml`, `write_raw`, `read`, `sleep`, and
+`close` steps. Setup and teardown run once; a cycle can repeat on the same
+socket. Reconnecting requires another explicit `connect` step. Android enforces
+one command at a time, the hardware/port leases, a 30-second deadline, 512
+expanded steps, 64 KiB transmitted and 256 KiB received. Arbitrary recipes are
+accepted only while the operator has explicitly selected `Lab only`.
+
+Select `Lab only` in the Telemetry tab to keep the foreground relay connected
+without reserving a controller capture port. The LAN relay emits a five-second
+heartbeat that never touches DJI hardware. This makes every localhost port
+available to a Mac-authored recipe without another APK build.
 
 Physical bench status from 2026-07-22/23: the earlier relay streamed over LAN
 while DJI Fly remained connected on the tested RC2, and the final `research.3`
@@ -227,7 +238,10 @@ returned no matched response. `research.5` added bounded raw response
 diagnostics. The `research.6` path used read-only `40007`: observed
 families `03/43`, `03/44`, `04/05` and `51/14` are retained as candidates.
 Aircraft identity is extracted only from a CRC-valid `51/14` frame on the
-observed `0xEE -> App` route.
+observed `0xEE -> App` route. The decoder now enforces Skylab's RM510 layout:
+one count/reserved prefix followed by exactly `N` 49-byte neighbor records.
+Identity matching is confined to each record's 23-byte identity region;
+link-state and timestamp/age words are retained as raw diagnostics.
 
 The 2026-07-23 Neo 2 bench correlation matched `03/43` latitude/longitude and
 aircraft yaw against DJI Fly/operator observations. These fields are now
@@ -256,19 +270,57 @@ The receiver preserves raw bytes and clears current georeference values after
 capture gaps. A one-shot GPS hMSL research request is available as
 `--probe-gps-hmsl`; it is never retried automatically.
 
+Run or edit a bounded lab strategy without rebuilding Android:
+
+```sh
+python -m rc2_telemetry_receiver \
+  --lab recipes/40007-version-keepalive.json
+```
+
+Starter recipes also cover a single direct `40009` transaction and a passive
+`8902` observation. Results contain every step, exact TX/RX bytes, validated
+DUML frames, parser errors and the terminal reason. See
+[`docs/DUML_LAB.md`](docs/DUML_LAB.md) for the recipe contract.
+
 Auto-FCC no longer writes a keepalive profile every two seconds. The FreeFCC
 Home Point Accessibility service waits on localized DJI Fly text without
 opening DUML, then sends the complete FCC profile once on a short `40009`
 lease. Manual FCC and the general one-shot DUML Lab remain available.
 
-`research.9` adds an explicit `40007 Primed` source based on Skylab's tested
-broker-window mechanism. It opens one socket, sends a fresh CRC-valid `03/44`
-request once per second on that same connection, and never reconnects after
-EOF or write failure. Outgoing primers are retained as TX evidence and never
-treated as incoming telemetry.
+The physical `research.9` session disproved its `03/44` primer strategy on the
+tested Neo 2: the second write reset the socket. `research.10` replaces it with
+the idle-triggered wrapped General Version Inquiry used by
+`stiad/dji-rc-linux`: `02 -> 06`, `00/01`, no ACK requested, fresh sequence and
+CRC on the same socket. A direct RC2 LAN check kept `40007` open for 3.011
+seconds, received 4,116 bytes and 92 CRC-valid frames while sending 40
+keepalives. The short check did not include `03/43` or `04/05`, so sustained
+georeference delivery and zero DJI Fly link warnings remain physical gates.
 
-Current research build: `1.5.3-research.9`. It remains bench-only
-until its physical RC2 gate has passed.
+The Mac receiver now emits one field-freshness-controlled
+`GEOREFERENCE_SAMPLE` per second. AMSL from candidate `03/57` and takeoff
+relative height from probable `03/43` remain separate, and a newer `03/43`
+cannot erase a fresh AMSL value. Samples carry stable source/session identity,
+field-level DUML provenance, RC capture time, Mac receive time and measured
+relay age. Relay age prefers the Android monotonic clock anchor from `HELLO`,
+so reconnect backlog cannot appear fresh because of RC wall-clock skew.
+
+Optional MQTT output is implemented only on the Mac. It publishes the exact
+stored envelope to `nordlys/rc2/{source_id}/georeference`, never publishes raw
+DUML, and drops disconnected, unclocked or stale samples instead of buffering
+them. MQTT is disabled by default and requires the companion's optional
+`requirements-mqtt.txt`.
+
+The 2026-07-25 review of SkylabFCCfree through `v1.5.49` also examined its
+single-notification foreground refactor and FCC country read/write checks.
+Neither is imported here: telemetry needs its own ongoing foreground service,
+and periodic `07/19`/`07/30` country traffic does not improve metadata capture.
+The structured RM510 `51/14` layout is the relevant change adopted in this
+release.
+
+Current research build: `1.5.3-research.10`. It remains bench-only until its
+physical RC2 gate has passed. See
+[`docs/TELEMETRY_ARCHITECTURE.md`](docs/TELEMETRY_ARCHITECTURE.md) for the
+transport boundary and acceptance gates.
 
 ### Research Update Channel
 

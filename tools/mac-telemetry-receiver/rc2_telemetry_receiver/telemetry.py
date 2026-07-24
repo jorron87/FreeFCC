@@ -61,12 +61,18 @@ def decode_candidate(event: dict[str, Any]) -> dict[str, Any] | None:
                 "aircraft_deg": yaw_raw * 0.1,
                 "reference": "aircraft_yaw_reference_unknown",
             },
+            "altitude": {
+                "amsl_m": None,
+                "relative_takeoff_m": relative_height_raw * 0.1,
+                "reference": "takeoff_relative",
+            },
             "gimbal": {"roll_deg": None, "pitch_deg": None, "yaw_deg": None},
             "quality": {
                 "position": position_quality,
                 "attitude": "probable",
                 "heading": "probable",
                 "altitude": "unknown",
+                "relative_altitude": "probable",
                 "gimbal": "unknown",
             },
             "raw": {
@@ -141,7 +147,10 @@ def decode_candidate(event: dict[str, Any]) -> dict[str, Any] | None:
         and (int(event.get("receiver", -1)) & 0x1F) == 0x02
         and event.get("validation_status") == "valid"
     ):
-        identity = _identity_candidates(payload)
+        neighbor_list = _decode_wlm_neighbor_list(payload)
+        if neighbor_list is None:
+            return None
+        identity = neighbor_list["identity"]
         if any(identity.values()):
             return {
                 **common,
@@ -157,7 +166,9 @@ def decode_candidate(event: dict[str, Any]) -> dict[str, Any] | None:
                 },
                 "raw": {
                     "message_family": "51/14",
-                    "layout_reference": "SkylabFCCfree live map, frame-scoped extraction",
+                    "layout_reference": "SkylabFCCfree@fb37257 RM510 static layout",
+                    "neighbor_count": neighbor_list["neighbor_count"],
+                    "neighbor_records": neighbor_list["records"],
                 },
             }
 
@@ -232,6 +243,8 @@ def _decode_gps_glns(payload: bytes, common: dict[str, Any]) -> dict[str, Any] |
         },
         "altitude": {
             "value_m": hmsl_m if altitude_valid else None,
+            "amsl_m": hmsl_m if altitude_valid else None,
+            "relative_takeoff_m": None,
             "reference": "mean_sea_level_geoid",
             "source": "gnss_hmsl",
         },
@@ -243,6 +256,7 @@ def _decode_gps_glns(payload: bytes, common: dict[str, Any]) -> dict[str, Any] |
             "attitude": "unknown",
             "heading": "unknown",
             "altitude": "candidate" if altitude_valid else "unknown",
+            "relative_altitude": "unknown",
             "gimbal": "unknown",
         },
         "raw": {
@@ -279,4 +293,44 @@ def _identity_candidates(payload: bytes) -> dict[str, str | None]:
         "aircraft_serial": match(rb"(?<![A-Z0-9])1581[A-Z0-9]{12,18}(?![A-Z0-9])"),
         "serial_suffix": match(rb"(?<![A-Z0-9])FA[A-Z0-9]{14}(?![A-Z0-9])"),
         "model_code": match(rb"(?<![A-Z0-9])W[AM][0-9]{3}(?![A-Z0-9])"),
+    }
+
+
+def _decode_wlm_neighbor_list(payload: bytes) -> dict[str, Any] | None:
+    if len(payload) < 2:
+        return None
+    neighbor_count = payload[0]
+    if len(payload) != 2 + (49 * neighbor_count):
+        return None
+
+    merged_identity: dict[str, str | None] = {
+        "aircraft_serial": None,
+        "serial_suffix": None,
+        "model_code": None,
+    }
+    records: list[dict[str, Any]] = []
+    for index in range(neighbor_count):
+        record = payload[2 + (49 * index) : 2 + (49 * (index + 1))]
+        identity_region = record[:23]
+        identity = _identity_candidates(identity_region)
+        for key, value in identity.items():
+            if merged_identity[key] is None and value is not None:
+                merged_identity[key] = value
+        records.append(
+            {
+                "index": index,
+                "identity": identity,
+                "identity_region_b64": base64.b64encode(identity_region).decode("ascii"),
+                "link_state_raw_u16": struct.unpack_from("<H", record, 23)[0],
+                "peer_state_type_raw_u8": record[25],
+                "link_modes_raw_b64": base64.b64encode(record[26:29]).decode("ascii"),
+                "timestamp_age_raw_u32": list(struct.unpack_from("<III", record, 29)),
+                "reserved_b64": base64.b64encode(record[41:49]).decode("ascii"),
+            }
+        )
+
+    return {
+        "neighbor_count": neighbor_count,
+        "identity": merged_identity,
+        "records": records,
     }

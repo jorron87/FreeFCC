@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -28,9 +29,12 @@ class TelemetryCaptureService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var relay: TelemetryRelayClient? = null
     private var captureJob: Job? = null
+    private var commandJob: Job? = null
     private var captureSocket: Socket? = null
     private var activeConfig: TelemetryConfig? = null
     private val probeTransport = DumlTransport()
+    private val dumlLabEngine = DumlLabEngine()
+    private var commandCancellation = DumlLabCancellation()
     private val commandInFlight = AtomicBoolean(false)
     private var lastCommandStartedElapsedMs = 0L
     private var sessionId: String = ""
@@ -47,6 +51,8 @@ class TelemetryCaptureService : Service() {
     private var sourceStatus = "stopped"
     private var lastByteElapsedNs = 0L
     private var lastTickElapsedNs = 0L
+    private var streamKeepaliveCount = 0L
+    private var lastKeepaliveStatsElapsedNs = 0L
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -60,8 +66,10 @@ class TelemetryCaptureService : Service() {
         return START_STICKY
     }
 
+    @Synchronized
     private fun startCapture(intent: Intent) {
         stopCapture(closeService = false)
+        commandCancellation = DumlLabCancellation()
 
         val host = intent.getStringExtra(EXTRA_HOST).orEmpty()
         val port = intent.getIntExtra(EXTRA_PORT, DEFAULT_RELAY_PORT)
@@ -69,8 +77,9 @@ class TelemetryCaptureService : Service() {
         if (
             host.isBlank() ||
             port !in 1..65535 ||
-            capturePort !in TelemetryRelayClient.RESEARCH_DUML_PORTS ||
-            (intent.getBooleanExtra(EXTRA_PRIMER_ENABLED, false) &&
+            (capturePort != CONTROL_ONLY_PORT &&
+                capturePort !in TelemetryRelayClient.RESEARCH_DUML_PORTS) ||
+            (intent.getBooleanExtra(EXTRA_STREAM_KEEPALIVE_ENABLED, false) &&
                 capturePort != DumlTransport.PORT_LED)
         ) {
             TelemetryStatusBus.update(
@@ -85,7 +94,7 @@ class TelemetryCaptureService : Service() {
             port = port,
             sourceId = intent.getStringExtra(EXTRA_SOURCE_ID).orEmpty().ifBlank { "rc2-bench" },
             capturePort = capturePort,
-            primerEnabled = intent.getBooleanExtra(EXTRA_PRIMER_ENABLED, false),
+            streamKeepaliveEnabled = intent.getBooleanExtra(EXTRA_STREAM_KEEPALIVE_ENABLED, false),
             controllerFirmware = intent.getStringExtra(EXTRA_CONTROLLER_FIRMWARE).orEmpty(),
             djiFlyVersion = intent.getStringExtra(EXTRA_DJI_FLY_VERSION).orEmpty(),
             aircraftModel = intent.getStringExtra(EXTRA_AIRCRAFT_MODEL).orEmpty(),
@@ -106,6 +115,8 @@ class TelemetryCaptureService : Service() {
         sourceStatus = "connecting"
         lastByteElapsedNs = 0L
         lastTickElapsedNs = 0L
+        streamKeepaliveCount = 0L
+        lastKeepaliveStatsElapsedNs = 0L
 
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification("Relay starting"))
@@ -121,6 +132,7 @@ class TelemetryCaptureService : Service() {
                 captureActive = false,
                 rawChunks = 0,
                 frames = 0,
+                keepalives = 0,
                 parserErrors = 0,
                 bytes = 0,
                 queueDepth = 0,
@@ -140,18 +152,41 @@ class TelemetryCaptureService : Service() {
             onFatal = { reason -> failClosed(reason) }
         ).also { it.start() }
 
-        captureJob = scope.launch {
-            runReadOnlyCapture(config)
+        if (config.sourceMode == TelemetrySourceMode.DumlLabControlOnly) {
+            sourceStatus = "control_only"
+            TelemetryStatusBus.update(
+                TelemetryStatus(
+                    connecting = true,
+                    sourceStatus = sourceStatus,
+                    captureActive = false,
+                    lastError = ""
+                )
+            )
+            emitSourceStatus(
+                config,
+                sourceStatus,
+                "DUML Lab ready; no controller capture port is held"
+            )
+        } else {
+            captureJob = scope.launch {
+                runCapture(config)
+            }
         }
     }
 
+    @Synchronized
     private fun handleRelayCommand(command: TelemetryRelayCommand) {
+        if (activeConfig == null) {
+            sendRelayFailure(command, "stopped", "Telemetry relay is not running")
+            return
+        }
         if (!commandInFlight.compareAndSet(false, true)) {
             sendRelayFailure(command, "busy", "Another DUML command is already running")
             return
         }
 
-        scope.launch {
+        val cancellation = commandCancellation
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             var hardwareLease: HardwareLock.Lease? = null
             var portLease: DumlPortSessionLock.Lease? = null
             try {
@@ -176,6 +211,7 @@ class TelemetryCaptureService : Service() {
                 val commandPort = when (command) {
                     is TelemetryRelayCommand.Probe -> DumlTransport.PORT
                     is TelemetryRelayCommand.Duml -> command.port
+                    is TelemetryRelayCommand.DumlLab -> command.recipe.port
                 }
                 portLease = DumlPortSessionLock.tryBegin(commandPort)
                 if (portLease == null) {
@@ -190,15 +226,18 @@ class TelemetryCaptureService : Service() {
                 when (command) {
                     is TelemetryRelayCommand.Probe -> executeFcOsdProbe(command)
                     is TelemetryRelayCommand.Duml -> executeDumlRequest(command)
+                    is TelemetryRelayCommand.DumlLab -> executeDumlLab(command, cancellation)
                 }
             } catch (e: Exception) {
                 sendRelayFailure(command, "error", e.message.orEmpty().ifBlank { "DUML request failed" })
             } finally {
                 portLease?.close()
                 hardwareLease?.close()
-                commandInFlight.set(false)
             }
         }
+        job.invokeOnCompletion { commandInFlight.set(false) }
+        commandJob = job
+        job.start()
     }
 
     private fun executeFcOsdProbe(command: TelemetryRelayCommand.Probe) {
@@ -287,6 +326,21 @@ class TelemetryCaptureService : Service() {
         }
     }
 
+    private fun executeDumlLab(
+        command: TelemetryRelayCommand.DumlLab,
+        cancellation: DumlLabCancellation
+    ) {
+        val result = dumlLabEngine.execute(command.recipe, cancellation)
+        relay?.enqueue(
+            TelemetryDumlLabResultEvent(
+                sessionId = sessionId,
+                requestId = command.requestId,
+                recipe = command.recipe,
+                result = result
+            )
+        )
+    }
+
     private fun sendProbeResult(
         requestId: String,
         status: String,
@@ -332,10 +386,17 @@ class TelemetryCaptureService : Service() {
         when (command) {
             is TelemetryRelayCommand.Probe -> sendProbeResult(command.requestId, status, message)
             is TelemetryRelayCommand.Duml -> sendDumlResult(command, status, message)
+            is TelemetryRelayCommand.DumlLab -> relay?.enqueue(
+                TelemetryDumlLabRejectedEvent(
+                    sessionId = sessionId,
+                    requestId = command.requestId,
+                    message = "$status: $message"
+                )
+            )
         }
     }
 
-    private suspend fun runReadOnlyCapture(config: TelemetryConfig) {
+    private suspend fun runCapture(config: TelemetryConfig) {
         val isPublishStream = config.sourceMode == TelemetrySourceMode.Rc2PublishStream
         val buffer = ByteArray(if (isPublishStream) 32 * 1024 else 4 * 1024)
         val dumlParser = if (isPublishStream) null else WrappedDumlFrameParser()
@@ -348,22 +409,38 @@ class TelemetryCaptureService : Service() {
         }
         val socket = Socket()
         captureSocket = socket
-        var gapReason = "Read-only source socket closed"
+        var gapReason = "Source socket closed"
         try {
             socket.connect(InetSocketAddress(DUML_HOST, sourcePort), DUML_CONNECT_TIMEOUT_MS)
             socket.tcpNoDelay = true
-            socket.soTimeout = SOURCE_READ_TIMEOUT_MS
-            val primer = if (config.primerEnabled) SameSocketTelemetryPrimer() else null
-            val output = if (primer != null) socket.getOutputStream() else null
-            var nextPrimerElapsedNs = 0L
-            if (primer != null && output != null) {
-                sendPrimer(config, primer, output, SystemClock.elapsedRealtimeNanos())
-                nextPrimerElapsedNs = SystemClock.elapsedRealtimeNanos() + PRIMER_INTERVAL_NS
-                sourceStatus = "primed_waiting"
+            socket.soTimeout = if (config.streamKeepaliveEnabled) {
+                STREAM_KEEPALIVE_READ_TIMEOUT_MS
+            } else {
+                SOURCE_READ_TIMEOUT_MS
+            }
+            val streamKeepalive = if (config.streamKeepaliveEnabled) {
+                SameSocketTelemetryKeepalive()
+            } else {
+                null
+            }
+            val keepaliveIdleGate = if (streamKeepalive != null) {
+                StreamKeepaliveIdleGate(STREAM_KEEPALIVE_IDLE_TIMEOUTS)
+            } else {
+                null
+            }
+            val output = if (streamKeepalive != null) socket.getOutputStream() else null
+            if (streamKeepalive != null && output != null) {
+                sendStreamKeepalive(
+                    config,
+                    streamKeepalive,
+                    output,
+                    SystemClock.elapsedRealtimeNanos()
+                )
+                sourceStatus = "keepalive_waiting"
                 emitSourceStatus(
                     config,
                     sourceStatus,
-                    "Connected; 1 Hz 03/44 refresh active on the same socket"
+                    "Connected; idle-based 00/01 keepalive active on the same socket"
                 )
             } else {
                 sourceStatus = "open_waiting"
@@ -382,23 +459,27 @@ class TelemetryCaptureService : Service() {
             val input = socket.getInputStream()
             while (currentCoroutineContext().isActive && !socket.isClosed) {
                 val beforeReadNs = SystemClock.elapsedRealtimeNanos()
-                if (primer != null && output != null && beforeReadNs >= nextPrimerElapsedNs) {
-                    sendPrimer(config, primer, output, beforeReadNs)
-                    nextPrimerElapsedNs = beforeReadNs + PRIMER_INTERVAL_NS
-                }
                 val n = try {
                     input.read(buffer)
                 } catch (_: java.net.SocketTimeoutException) {
+                    if (
+                        streamKeepalive != null &&
+                        keepaliveIdleGate?.onReadTimeout() == true &&
+                        output != null
+                    ) {
+                        sendStreamKeepalive(config, streamKeepalive, output, beforeReadNs)
+                    }
                     updateSourceSilence(config, beforeReadNs)
                     emitTickIfDue(config, beforeReadNs)
                     continue
                 }
                 if (n <= 0) break
+                keepaliveIdleGate?.onBytesReceived()
                 val capturedElapsedNs = SystemClock.elapsedRealtimeNanos()
                 lastByteElapsedNs = capturedElapsedNs
                 if (sourceStatus != "active") {
                     sourceStatus = "active"
-                    emitSourceStatus(config, "active", "Receiving read-only source bytes")
+                    emitSourceStatus(config, "active", "Receiving source bytes")
                 }
                 val bytes = buffer.copyOf(n)
                 val seq = ++rawSeq
@@ -482,6 +563,7 @@ class TelemetryCaptureService : Service() {
                         sourceStatus = sourceStatus,
                         rawChunks = rawChunks,
                         frames = frameCount,
+                        keepalives = streamKeepaliveCount,
                         records = recordCount,
                         parserErrors = parserErrors,
                         bytes = byteCount
@@ -561,27 +643,48 @@ class TelemetryCaptureService : Service() {
         )
     }
 
-    private fun sendPrimer(
+    private fun sendStreamKeepalive(
         config: TelemetryConfig,
-        primer: SameSocketTelemetryPrimer,
+        keepalive: SameSocketTelemetryKeepalive,
         output: java.io.OutputStream,
         elapsedNs: Long
     ) {
-        val bytes = primer.next()
+        val bytes = keepalive.next()
         output.write(bytes)
         output.flush()
-        val seq = ++rawSeq
-        relay?.enqueue(
-            RawChunkEvent(
-                sessionId = sessionId,
-                seq = seq,
-                elapsedRealtimeNs = elapsedNs,
-                source = config.sourceMode.wireName,
-                direction = "client_to_controller",
-                port = config.capturePort,
-                bytes = bytes
+        streamKeepaliveCount += 1
+        if (
+            lastKeepaliveStatsElapsedNs == 0L ||
+            elapsedNs - lastKeepaliveStatsElapsedNs >= KEEPALIVE_STATS_INTERVAL_NS
+        ) {
+            lastKeepaliveStatsElapsedNs = elapsedNs
+            TelemetryStatusBus.update(TelemetryStatus(keepalives = streamKeepaliveCount))
+            relay?.enqueue(
+                StreamKeepaliveStatsEvent(
+                    sessionId = sessionId,
+                    elapsedRealtimeNs = elapsedNs,
+                    source = config.sourceMode.wireName,
+                    port = config.capturePort,
+                    sentCount = streamKeepaliveCount,
+                    readTimeoutMs = STREAM_KEEPALIVE_READ_TIMEOUT_MS,
+                    idleTimeoutsBeforeSend = STREAM_KEEPALIVE_IDLE_TIMEOUTS
+                )
             )
-        )
+        }
+        if (streamKeepaliveCount == 1L) {
+            val seq = ++rawSeq
+            relay?.enqueue(
+                RawChunkEvent(
+                    sessionId = sessionId,
+                    seq = seq,
+                    elapsedRealtimeNs = elapsedNs,
+                    source = config.sourceMode.wireName,
+                    direction = "client_to_controller",
+                    port = config.capturePort,
+                    bytes = bytes
+                )
+            )
+        }
     }
 
     private fun emitTickIfDue(config: TelemetryConfig, nowNs: Long) {
@@ -686,7 +789,11 @@ class TelemetryCaptureService : Service() {
         stopCapture()
     }
 
+    @Synchronized
     private fun stopCapture(closeService: Boolean = true) {
+        commandCancellation.cancel()
+        commandJob?.cancel()
+        commandJob = null
         captureJob?.cancel()
         captureJob = null
         try { captureSocket?.close() } catch (_: Exception) {}
@@ -768,7 +875,9 @@ class TelemetryCaptureService : Service() {
         private const val DUML_CONNECT_TIMEOUT_MS = 2_000
         private const val SOURCE_READ_TIMEOUT_MS = 250
         private const val SOURCE_GAP_AFTER_MS = 2_000L
-        private const val PRIMER_INTERVAL_NS = 1_000_000_000L
+        private const val STREAM_KEEPALIVE_READ_TIMEOUT_MS = 20
+        private const val STREAM_KEEPALIVE_IDLE_TIMEOUTS = 2
+        private const val KEEPALIVE_STATS_INTERVAL_NS = 1_000_000_000L
         private const val MIN_COMMAND_INTERVAL_MS = 500L
         private const val DEFAULT_RELAY_PORT = 8765
 
@@ -778,7 +887,7 @@ class TelemetryCaptureService : Service() {
         private const val EXTRA_PORT = "port"
         private const val EXTRA_SOURCE_ID = "source_id"
         private const val EXTRA_CAPTURE_PORT = "capture_port"
-        private const val EXTRA_PRIMER_ENABLED = "primer_enabled"
+        private const val EXTRA_STREAM_KEEPALIVE_ENABLED = "stream_keepalive_enabled"
         private const val EXTRA_CONTROLLER_FIRMWARE = "controller_firmware"
         private const val EXTRA_DJI_FLY_VERSION = "dji_fly_version"
         private const val EXTRA_AIRCRAFT_MODEL = "aircraft_model"
@@ -791,7 +900,7 @@ class TelemetryCaptureService : Service() {
                 putExtra(EXTRA_PORT, config.port)
                 putExtra(EXTRA_SOURCE_ID, config.sourceId)
                 putExtra(EXTRA_CAPTURE_PORT, config.capturePort)
-                putExtra(EXTRA_PRIMER_ENABLED, config.primerEnabled)
+                putExtra(EXTRA_STREAM_KEEPALIVE_ENABLED, config.streamKeepaliveEnabled)
                 putExtra(EXTRA_CONTROLLER_FIRMWARE, config.controllerFirmware)
                 putExtra(EXTRA_DJI_FLY_VERSION, config.djiFlyVersion)
                 putExtra(EXTRA_AIRCRAFT_MODEL, config.aircraftModel)

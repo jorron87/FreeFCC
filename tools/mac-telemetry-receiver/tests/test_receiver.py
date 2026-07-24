@@ -8,6 +8,7 @@ import struct
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from rc2_telemetry_receiver.duml import (
@@ -19,6 +20,11 @@ from rc2_telemetry_receiver.duml import (
     crc8,
 )
 from rc2_telemetry_receiver.pcap import iter_pcap_tcp_payloads
+from rc2_telemetry_receiver.mqtt import (
+    MqttConfig,
+    MqttGeoreferencePublisher,
+    parse_mqtt_url,
+)
 from rc2_telemetry_receiver.publish8902 import (
     PublishParseError,
     PublishRecord,
@@ -27,6 +33,7 @@ from rc2_telemetry_receiver.publish8902 import (
 from rc2_telemetry_receiver.receiver import (
     RelayControlHub,
     SessionWriter,
+    _validate_loopback_control_bind,
     error_event,
     extract_serial_candidate,
     handle_payload_stream,
@@ -114,17 +121,17 @@ class Publish8902ParserTest(unittest.TestCase):
 
 
 class SessionWriterTest(unittest.TestCase):
-    def test_outbound_primer_is_evidence_not_inbound_stream(self) -> None:
+    def test_outbound_keepalive_is_evidence_not_inbound_stream(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             writer = SessionWriter(Path(tmp))
             writer.handle_event(
                 raw_chunk_event(
-                    session_id="primed-session",
+                    session_id="keepalive-session",
                     seq=1,
-                    source="bench_wrapped_primed",
+                    source="bench_wrapped_keepalive",
                     direction="client_to_controller",
                     port=40007,
-                    data=b"primer",
+                    data=b"keepalive",
                 )
             )
 
@@ -132,7 +139,7 @@ class SessionWriterTest(unittest.TestCase):
             self.assertFalse((writer.session_dir / "raw-stream.bin").exists())
             self.assertEqual("unknown", writer.stats.capture_state)
             self.assertEqual(
-                b"primer",
+                b"keepalive",
                 next((writer.session_dir / "raw").glob("*client_to_controller.bin")).read_bytes(),
             )
 
@@ -225,6 +232,56 @@ class SessionWriterTest(unittest.TestCase):
                 (writer.session_dir / "raw-stream.bin").read_bytes(),
             )
 
+    def test_replay_preserves_duml_frame_and_rebuilds_candidate(self) -> None:
+        payload = bytearray(48)
+        struct.pack_into("<dd", payload, 0, 0.185, 1.047)
+        struct.pack_into("<h", payload, 16, 123)
+        struct.pack_into("<hhh", payload, 24, 55, -22, 900)
+        frame_event = {
+            **_frame_event(cmd_set=0x03, cmd_id=0x43, payload=bytes(payload)),
+            "session_id": "frame-replay",
+            "elapsed_realtime_ns": 1_000_000_000,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.ndjson"
+            events = [
+                {
+                    "type": "HELLO",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "frame-replay",
+                    "source_mode": "bench_wrapped_keepalive",
+                },
+                frame_event,
+                {
+                    "type": "TELEMETRY_TICK",
+                    "session_id": "frame-replay",
+                    "source_status": "active",
+                    "elapsed_realtime_ns": 2_000_000_000,
+                },
+            ]
+            source.write_text(
+                "".join(json.dumps(event) + "\n" for event in events),
+                encoding="utf-8",
+            )
+
+            writer = replay_session(source, root / "replayed")
+
+            assert writer.session_dir is not None
+            replayed = [
+                json.loads(line)
+                for line in (writer.session_dir / "session.ndjson").read_text().splitlines()
+            ]
+            stored_frame = next(event for event in replayed if event["type"] == "DUML_FRAME")
+            sample = next(
+                event for event in replayed if event["type"] == "GEOREFERENCE_SAMPLE"
+            )
+            self.assertEqual(frame_event["raw_frame_b64"], stored_frame["raw_frame_b64"])
+            self.assertAlmostEqual(
+                59.98868115019719,
+                sample["position"]["lat_deg"],
+            )
+
     def test_payload_stream_writes_ndjson_summary_and_raw_bytes(self) -> None:
         frame = build_test_frame(payload=b"\x10\x20")
         with tempfile.TemporaryDirectory() as tmp:
@@ -289,10 +346,326 @@ class SessionWriterTest(unittest.TestCase):
         self.assertEqual(-2.2, candidate["attitude"]["roll_deg"])
         self.assertEqual(90.0, candidate["attitude"]["yaw_deg"])
         self.assertEqual(90.0, candidate["heading"]["aircraft_deg"])
+        self.assertEqual(12.3, candidate["altitude"]["relative_takeoff_m"])
         self.assertEqual(12.3, candidate["raw"]["relative_height_m_candidate"])
         self.assertEqual("probable", candidate["quality"]["position"])
         self.assertEqual("probable", candidate["quality"]["attitude"])
         self.assertEqual("unknown", candidate["quality"]["altitude"])
+        self.assertEqual("probable", candidate["quality"]["relative_altitude"])
+
+    def test_georeference_sample_exposes_fresh_relative_height_then_clears_it(self) -> None:
+        payload = bytearray(48)
+        struct.pack_into("<dd", payload, 0, 0.185, 1.047)
+        struct.pack_into("<h", payload, 16, 123)
+        struct.pack_into("<hhh", payload, 24, 55, -22, 900)
+        frame = {
+            **_frame_event(cmd_set=0x03, cmd_id=0x43, payload=bytes(payload)),
+            "elapsed_realtime_ns": 1_000_000_000,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = SessionWriter(Path(tmp))
+            writer.handle_event(
+                {
+                    "type": "HELLO",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "relative-height",
+                    "source_mode": "bench_wrapped_keepalive",
+                }
+            )
+            writer.handle_event(
+                {
+                    "type": "SOURCE_STATUS",
+                    "session_id": "relative-height",
+                    "status": "active",
+                    "elapsed_realtime_ns": 900_000_000,
+                }
+            )
+            writer.handle_event(frame)
+            writer.handle_event(
+                {
+                    "type": "TELEMETRY_TICK",
+                    "session_id": "relative-height",
+                    "source": "bench_wrapped_keepalive",
+                    "source_status": "active",
+                    "elapsed_realtime_ns": 2_000_000_000,
+                }
+            )
+            writer.handle_event(
+                {
+                    "type": "TELEMETRY_TICK",
+                    "session_id": "relative-height",
+                    "source": "bench_wrapped_keepalive",
+                    "source_status": "active",
+                    "elapsed_realtime_ns": 4_000_000_000,
+                }
+            )
+
+            assert writer.session_dir is not None
+            events = [
+                json.loads(line)
+                for line in (writer.session_dir / "session.ndjson").read_text().splitlines()
+            ]
+            samples = [event for event in events if event["type"] == "GEOREFERENCE_SAMPLE"]
+
+            self.assertEqual(12.3, samples[0]["altitude"]["relative_takeoff_m"])
+            self.assertEqual("probable", samples[0]["quality"]["relative_altitude"])
+            self.assertIsNone(samples[1]["altitude"]["relative_takeoff_m"])
+            self.assertEqual("unavailable", samples[1]["quality"]["relative_altitude"])
+
+    def test_parser_error_invalidates_fields_until_each_family_recovers(self) -> None:
+        osd_payload = bytearray(48)
+        struct.pack_into("<dd", osd_payload, 0, 0.185, 1.047)
+        struct.pack_into("<h", osd_payload, 16, 123)
+        struct.pack_into("<hhh", osd_payload, 24, 55, -22, 900)
+        gimbal_payload = struct.pack("<hhh", -600, 10, 25) + bytes(6)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = SessionWriter(Path(tmp))
+            writer.handle_event(
+                {
+                    "type": "HELLO",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "parser-invalidation",
+                    "source_mode": "bench_wrapped_keepalive",
+                }
+            )
+            writer.handle_event(
+                {
+                    "type": "SOURCE_STATUS",
+                    "session_id": "parser-invalidation",
+                    "status": "active",
+                    "elapsed_realtime_ns": 900_000_000,
+                }
+            )
+            writer.handle_event(
+                {
+                    **_frame_event(
+                        cmd_set=0x03,
+                        cmd_id=0x43,
+                        payload=bytes(osd_payload),
+                    ),
+                    "session_id": "parser-invalidation",
+                    "elapsed_realtime_ns": 1_000_000_000,
+                }
+            )
+            writer.handle_event(
+                {
+                    "type": "ERROR",
+                    "session_id": "parser-invalidation",
+                    "reason": "crc16_mismatch",
+                    "detail": "test",
+                }
+            )
+            writer.handle_event(
+                {
+                    **_frame_event(
+                        cmd_set=0x04,
+                        cmd_id=0x05,
+                        payload=gimbal_payload,
+                    ),
+                    "session_id": "parser-invalidation",
+                    "elapsed_realtime_ns": 1_500_000_000,
+                }
+            )
+            writer.handle_event(
+                {
+                    "type": "TELEMETRY_TICK",
+                    "session_id": "parser-invalidation",
+                    "source_status": "active",
+                    "elapsed_realtime_ns": 2_000_000_000,
+                }
+            )
+
+            assert writer.session_dir is not None
+            samples = [
+                json.loads(line)
+                for line in (writer.session_dir / "session.ndjson").read_text().splitlines()
+                if '"type":"GEOREFERENCE_SAMPLE"' in line
+            ]
+
+        self.assertIsNone(samples[0]["position"]["lat_deg"])
+        self.assertEqual("unavailable", samples[0]["quality"]["position"])
+        self.assertEqual(-60.0, samples[0]["gimbal"]["pitch_deg"])
+        self.assertEqual("candidate", samples[0]["quality"]["gimbal"])
+
+    def test_relay_reconnect_invalidates_previous_dynamic_values(self) -> None:
+        payload = bytearray(48)
+        struct.pack_into("<dd", payload, 0, 0.185, 1.047)
+        struct.pack_into("<hhh", payload, 24, 55, -22, 900)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = SessionWriter(Path(tmp))
+            hello = {
+                "type": "HELLO",
+                "schema": "dji-rc2-telemetry/v2",
+                "session_id": "relay-reconnect",
+                "source_id": "neo2",
+                "source_mode": "bench_wrapped_keepalive",
+            }
+            writer.handle_event(hello)
+            writer.handle_event(
+                {
+                    "type": "SOURCE_STATUS",
+                    "session_id": "relay-reconnect",
+                    "status": "active",
+                    "elapsed_realtime_ns": 900_000_000,
+                }
+            )
+            writer.handle_event(
+                {
+                    **_frame_event(cmd_set=0x03, cmd_id=0x43, payload=bytes(payload)),
+                    "session_id": "relay-reconnect",
+                    "elapsed_realtime_ns": 1_000_000_000,
+                }
+            )
+            writer.handle_event(hello)
+            writer.handle_event(
+                {
+                    "type": "TELEMETRY_TICK",
+                    "session_id": "relay-reconnect",
+                    "source_status": "active",
+                    "elapsed_realtime_ns": 2_000_000_000,
+                }
+            )
+
+            assert writer.session_dir is not None
+            sample = next(
+                json.loads(line)
+                for line in (writer.session_dir / "session.ndjson").read_text().splitlines()
+                if '"type":"GEOREFERENCE_SAMPLE"' in line
+            )
+
+        self.assertIsNone(sample["position"]["lat_deg"])
+        self.assertEqual("unavailable", sample["quality"]["position"])
+
+    def test_queued_frame_before_reconnect_hello_stays_historical(self) -> None:
+        payload = bytearray(48)
+        struct.pack_into("<dd", payload, 0, 0.185, 1.047)
+        struct.pack_into("<hhh", payload, 24, 55, -22, 900)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = SessionWriter(Path(tmp))
+            writer.handle_event(
+                {
+                    "type": "HELLO",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "queued-reconnect",
+                    "source_mode": "bench_wrapped_keepalive",
+                    "created_at": "2026-07-25T12:00:01.000Z",
+                    "elapsed_realtime_ns": 1_000_000_000,
+                }
+            )
+            writer.handle_event(
+                {
+                    "type": "HELLO",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "queued-reconnect",
+                    "source_mode": "bench_wrapped_keepalive",
+                    "created_at": "2026-07-25T12:00:10.000Z",
+                    "elapsed_realtime_ns": 10_000_000_000,
+                }
+            )
+            old_frame = {
+                **_frame_event(cmd_set=0x03, cmd_id=0x43, payload=bytes(payload)),
+                "session_id": "queued-reconnect",
+                "wall_time_utc": "2026-07-25T12:00:09.000Z",
+                "elapsed_realtime_ns": 9_000_000_000,
+            }
+            writer.handle_event(old_frame)
+            writer.handle_event(
+                {
+                    "type": "TELEMETRY_TICK",
+                    "session_id": "queued-reconnect",
+                    "source_status": "active",
+                    "elapsed_realtime_ns": 11_000_000_000,
+                }
+            )
+
+            assert writer.session_dir is not None
+            events = [
+                json.loads(line)
+                for line in (writer.session_dir / "session.ndjson").read_text().splitlines()
+            ]
+            stored_frame = next(event for event in events if event["type"] == "DUML_FRAME")
+            sample = next(
+                event for event in events if event["type"] == "GEOREFERENCE_SAMPLE"
+            )
+            summary = json.loads((writer.session_dir / "session-summary.json").read_text())
+
+        self.assertEqual(old_frame["raw_frame_b64"], stored_frame["raw_frame_b64"])
+        self.assertEqual(1, summary["duml_frames"])
+        self.assertIsNone(sample["position"]["lat_deg"])
+        self.assertEqual("unavailable", sample["quality"]["position"])
+
+    def test_initial_connection_accepts_current_session_queue_before_hello(self) -> None:
+        payload = bytearray(48)
+        struct.pack_into("<dd", payload, 0, 0.185, 1.047)
+        struct.pack_into("<hhh", payload, 24, 55, -22, 900)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = SessionWriter(Path(tmp))
+            writer.handle_event(
+                {
+                    "type": "HELLO",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "initial-queue",
+                    "source_mode": "bench_wrapped_keepalive",
+                    "created_at": "2026-07-25T12:00:10.000Z",
+                    "elapsed_realtime_ns": 10_000_000_000,
+                }
+            )
+            writer.handle_event(
+                {
+                    **_frame_event(cmd_set=0x03, cmd_id=0x43, payload=bytes(payload)),
+                    "session_id": "initial-queue",
+                    "wall_time_utc": "2026-07-25T12:00:09.000Z",
+                    "elapsed_realtime_ns": 9_000_000_000,
+                }
+            )
+            writer.handle_event(
+                {
+                    "type": "TELEMETRY_TICK",
+                    "session_id": "initial-queue",
+                    "source_status": "active",
+                    "elapsed_realtime_ns": 11_000_000_000,
+                }
+            )
+
+            assert writer.session_dir is not None
+            sample = next(
+                json.loads(line)
+                for line in (writer.session_dir / "session.ndjson").read_text().splitlines()
+                if '"type":"GEOREFERENCE_SAMPLE"' in line
+            )
+
+        self.assertAlmostEqual(59.98868115019719, sample["position"]["lat_deg"])
+        self.assertEqual("probable", sample["quality"]["position"])
+
+    def test_keepalive_stats_are_recorded_without_raw_artifact_expansion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = SessionWriter(Path(tmp))
+            writer.handle_event(
+                {
+                    "type": "HELLO",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "keepalive-stats",
+                    "source_mode": "bench_wrapped_keepalive",
+                }
+            )
+            writer.handle_event(
+                {
+                    "type": "STREAM_KEEPALIVE_STATS",
+                    "session_id": "keepalive-stats",
+                    "sent_count": 42,
+                    "command_family": "00/01",
+                }
+            )
+
+            assert writer.session_dir is not None
+            summary = json.loads((writer.session_dir / "session-summary.json").read_text())
+            self.assertEqual(42, summary["stream_keepalives"])
+            self.assertEqual([], list((writer.session_dir / "raw").iterdir()))
 
     def test_gps_glns_candidate_decodes_hmsl_millimetres(self) -> None:
         payload = bytearray(34)
@@ -311,6 +684,91 @@ class SessionWriterTest(unittest.TestCase):
         self.assertEqual("candidate", candidate["quality"]["altitude"])
         self.assertEqual(18, candidate["raw"]["satellites"])
         self.assertTrue(candidate["raw"]["home_point_recorded_candidate"])
+
+    def test_sample_keeps_amsl_separate_from_newer_relative_height(self) -> None:
+        gps_payload = bytearray(34)
+        struct.pack_into("<iii", gps_payload, 0, 103_931_366, 591_011_495, 7_420)
+        osd_payload = bytearray(48)
+        struct.pack_into("<dd", osd_payload, 0, 0.181398395, 1.03150916)
+        struct.pack_into("<h", osd_payload, 16, 123)
+        struct.pack_into("<hhh", osd_payload, 24, 55, -22, 310)
+        now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z"
+        )
+        sink = _RecordingSink()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = SessionWriter(Path(tmp), [sink])
+            writer.handle_event(
+                {
+                    "type": "HELLO",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "combined-height",
+                    "source_id": "neo2-rc2-H103",
+                    "source_mode": "bench_wrapped_keepalive",
+                    "created_at": now,
+                    "elapsed_realtime_ns": 800_000_000,
+                }
+            )
+            writer.handle_event(
+                {
+                    "type": "SOURCE_STATUS",
+                    "session_id": "combined-height",
+                    "status": "active",
+                    "elapsed_realtime_ns": 900_000_000,
+                }
+            )
+            writer.handle_event(
+                {
+                    **_frame_event(
+                        cmd_set=0x03,
+                        cmd_id=0x57,
+                        payload=bytes(gps_payload),
+                    ),
+                    "session_id": "combined-height",
+                    "elapsed_realtime_ns": 1_000_000_000,
+                }
+            )
+            writer.handle_event(
+                {
+                    **_frame_event(
+                        cmd_set=0x03,
+                        cmd_id=0x43,
+                        payload=bytes(osd_payload),
+                    ),
+                    "session_id": "combined-height",
+                    "elapsed_realtime_ns": 1_100_000_000,
+                }
+            )
+            writer.handle_event(
+                {
+                    "type": "TELEMETRY_TICK",
+                    "session_id": "combined-height",
+                    "source": "bench_wrapped_keepalive",
+                    "source_status": "active",
+                    "elapsed_realtime_ns": 2_000_000_000,
+                    "wall_time_utc": now,
+                }
+            )
+
+            assert writer.session_dir is not None
+            stored = [
+                json.loads(line)
+                for line in (writer.session_dir / "session.ndjson").read_text().splitlines()
+                if '"type":"GEOREFERENCE_SAMPLE"' in line
+            ][0]
+            summary = json.loads((writer.session_dir / "session-summary.json").read_text())
+
+        self.assertEqual("neo2-rc2-H103", stored["source_id"])
+        self.assertEqual(7.42, stored["altitude"]["amsl_m"])
+        self.assertEqual(12.3, stored["altitude"]["relative_takeoff_m"])
+        self.assertEqual(7.42, stored["position"]["alt_m"])
+        self.assertEqual("mean_sea_level_geoid", stored["altitude"]["amsl_reference"])
+        self.assertEqual("takeoff_relative", stored["altitude"]["relative_reference"])
+        self.assertEqual("03/57", stored["raw"]["message_families"]["altitude"])
+        self.assertEqual("03/43", stored["raw"]["message_families"]["position"])
+        self.assertEqual(stored, sink.samples[0])
+        self.assertEqual("neo2-rc2-H103", summary["georef"]["source_id"])
 
     def test_gps_glns_duml_result_uses_the_same_decoder(self) -> None:
         payload = struct.pack("<iii", 103_931_366, 591_011_495, 7_420)
@@ -340,7 +798,13 @@ class SessionWriterTest(unittest.TestCase):
         self.assertEqual("candidate", candidate["quality"]["gimbal"])
 
     def test_aircraft_serial_is_only_extracted_from_valid_51_14_route(self) -> None:
-        payload = b"\x00WA150\x001581F6ABCDEF1234\x00FA1234567890ABCD\x00"
+        record = bytearray(49)
+        record[:23] = b"WA150\x001581F6ABCDEF1234\x00"
+        struct.pack_into("<H", record, 23, 0x1234)
+        record[25] = 7
+        record[26:29] = b"\x01\x02\x03"
+        struct.pack_into("<III", record, 29, 1_000, 2_000, 3_000)
+        payload = b"\x01\x00" + bytes(record)
         event = _frame_event(
             cmd_set=0x51,
             cmd_id=0x14,
@@ -353,12 +817,39 @@ class SessionWriterTest(unittest.TestCase):
 
         assert candidate is not None
         self.assertEqual("1581F6ABCDEF1234", candidate["identity"]["aircraft_serial"])
-        self.assertEqual("FA1234567890ABCD", candidate["identity"]["serial_suffix"])
+        self.assertIsNone(candidate["identity"]["serial_suffix"])
         self.assertEqual("WA150", candidate["identity"]["model_code"])
         self.assertEqual("candidate", candidate["quality"]["identity"])
+        self.assertEqual(1, candidate["raw"]["neighbor_count"])
+        self.assertEqual(0x1234, candidate["raw"]["neighbor_records"][0]["link_state_raw_u16"])
+        self.assertEqual(
+            [1_000, 2_000, 3_000],
+            candidate["raw"]["neighbor_records"][0]["timestamp_age_raw_u32"],
+        )
 
         wrong_family = {**event, "cmd_id": 0x13}
         self.assertIsNone(decode_candidate(wrong_family))
+
+    def test_51_14_rejects_bad_record_length_and_identity_outside_identity_region(self) -> None:
+        bad_length = _frame_event(
+            cmd_set=0x51,
+            cmd_id=0x14,
+            payload=b"\x01\x00" + bytes(48),
+            sender=0xEE,
+            receiver=0x82,
+        )
+        self.assertIsNone(decode_candidate(bad_length))
+
+        record = bytearray(49)
+        record[23:39] = b"1581F6ABCDEF1234"
+        outside_identity_region = _frame_event(
+            cmd_set=0x51,
+            cmd_id=0x14,
+            payload=b"\x01\x00" + bytes(record),
+            sender=0xEE,
+            receiver=0x82,
+        )
+        self.assertIsNone(decode_candidate(outside_identity_region))
 
     def test_home_point_state_remains_candidate_and_position_null(self) -> None:
         payload = bytearray(102)
@@ -424,8 +915,42 @@ class SessionWriterTest(unittest.TestCase):
             self.assertEqual(-4.5, summary["georef"]["attitude"]["pitch_deg"])
             self.assertEqual("candidate", summary["georef"]["quality"]["attitude"])
 
+    def test_transport_age_prefers_android_monotonic_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = SessionWriter(Path(tmp))
+            hello_received = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
+            writer._align_rc_clock(
+                {
+                    "created_at": "2026-07-25T12:00:00.000Z",
+                    "elapsed_realtime_ns": 10_000_000_000,
+                },
+                hello_received,
+            )
+
+            sample = writer._build_georeference_sample(
+                {
+                    "type": "TELEMETRY_TICK",
+                    "source_status": "active",
+                    "elapsed_realtime_ns": 8_000_000_000,
+                    "wall_time_utc": "2099-01-01T00:00:00.000Z",
+                },
+                hello_received.replace(second=1),
+            )
+
+        self.assertEqual(3_000, sample["clock"]["transport_age_ms"])
+        self.assertEqual(
+            "android_monotonic",
+            sample["clock"]["transport_age_source"],
+        )
+
 
 class RelayControlHubTest(unittest.TestCase):
+    def test_control_bind_rejects_non_loopback_address(self) -> None:
+        _validate_loopback_control_bind("127.0.0.1:8766")
+        _validate_loopback_control_bind("::1:8766")
+        with self.assertRaisesRegex(ValueError, "loopback"):
+            _validate_loopback_control_bind("0.0.0.0:8766")
+
     def test_stale_disconnect_does_not_detach_newer_connection(self) -> None:
         stale_app, stale_mac = socket.socketpair()
         current_app, current_mac = socket.socketpair()
@@ -545,6 +1070,101 @@ class RelayControlHubTest(unittest.TestCase):
         self.assertEqual(0x43, received["cmd_id"])
         self.assertEqual("ok", result["status"])
 
+    def test_duml_lab_recipe_is_forwarded_and_correlated(self) -> None:
+        app_side, mac_side = socket.socketpair()
+        hub = RelayControlHub()
+        hub.attach(app_side)
+        received: dict[str, object] = {}
+        recipe = {
+            "schema": "duml-lab/v1",
+            "name": "unit",
+            "port": 49123,
+            "setup": [{"op": "connect"}],
+            "cycle": [],
+            "cycle_count": 0,
+            "teardown": [{"op": "close"}],
+        }
+
+        def respond() -> None:
+            with mac_side.makefile("r", encoding="utf-8") as reader:
+                command = json.loads(reader.readline())
+                received.update(command)
+                hub.handle_event(
+                    {
+                        "type": "DUML_LAB_RESULT",
+                        "request_id": command["request_id"],
+                        "status": "ok",
+                        "recipe": command["recipe"],
+                    }
+                )
+
+        thread = threading.Thread(target=respond)
+        thread.start()
+        try:
+            result = hub.request(
+                {"type": "DUML_LAB_REQUEST", "recipe": recipe},
+                timeout=1.0,
+            )
+        finally:
+            thread.join(timeout=1.0)
+            app_side.close()
+            mac_side.close()
+
+        self.assertEqual("DUML_LAB_REQUEST", received["type"])
+        self.assertEqual(recipe, received["recipe"])
+        self.assertEqual("ok", result["status"])
+
+
+class MqttPublisherTest(unittest.TestCase):
+    def test_url_defaults_and_tls_are_explicit(self) -> None:
+        plain = parse_mqtt_url("mqtt://broker.local")
+        secure = parse_mqtt_url("mqtts://user:secret@broker.local")
+
+        self.assertEqual(1883, plain.port)
+        self.assertFalse(plain.tls)
+        self.assertEqual(8883, secure.port)
+        self.assertTrue(secure.tls)
+        self.assertEqual("user", secure.username)
+
+    def test_live_sample_uses_stable_topic_and_stale_samples_are_dropped(self) -> None:
+        client = _FakeMqttClient()
+        mqtt_module = _FakeMqttModule()
+        publisher = MqttGeoreferencePublisher(
+            MqttConfig(
+                url="mqtt://broker.local",
+                topic_prefix="nordlys/rc2",
+                client_id="mac receiver",
+            ),
+            mqtt_module=mqtt_module,
+            client=client,
+        )
+        publisher._on_connect(client, None, None, 0, None)
+        sample = {
+            "type": "GEOREFERENCE_SAMPLE",
+            "schema": "dji-rc2-telemetry/v2",
+            "source_id": "neo2 rc/H103",
+            "clock": {"transport_age_ms": 20},
+            "position": {"lat_deg": 59.1, "lon_deg": 10.3},
+        }
+
+        self.assertTrue(publisher.publish(sample))
+        topic, payload, qos, retain = next(
+            item for item in client.published if item[0].endswith("/georeference")
+        )
+        self.assertEqual("nordlys/rc2/neo2_rc_H103/georeference", topic)
+        self.assertEqual(sample, json.loads(payload))
+        self.assertEqual(0, qos)
+        self.assertFalse(retain)
+
+        stale = {**sample, "clock": {"transport_age_ms": 3_000}}
+        self.assertFalse(publisher.publish(stale))
+        self.assertEqual(1, publisher.stats.published)
+        self.assertEqual(1, publisher.stats.dropped_stale)
+
+        publisher._on_disconnect(client, None, None, 0, None)
+        self.assertFalse(publisher.publish(sample))
+        self.assertEqual(1, publisher.stats.dropped_disconnected)
+
 
 class PcapParserTest(unittest.TestCase):
     def test_ipv4_tcp_payload_is_extracted_from_raw_pcap(self) -> None:
@@ -638,6 +1258,82 @@ def _pcap_raw(packets: list[bytes]) -> bytes:
         out += struct.pack("<IIII", 0, 0, len(packet), len(packet))
         out += packet
     return bytes(out)
+
+
+class _RecordingSink:
+    def __init__(self) -> None:
+        self.samples: list[dict[str, object]] = []
+
+    def publish(self, sample: dict[str, object]) -> bool:
+        self.samples.append(sample)
+        return True
+
+
+class _FakePublishInfo:
+    def __init__(self, rc: int = 0) -> None:
+        self.rc = rc
+
+    def wait_for_publish(self, timeout: float) -> None:
+        del timeout
+
+
+class _FakeMqttClient:
+    def __init__(self) -> None:
+        self.published: list[tuple[str, str, int, bool]] = []
+        self.on_connect = None
+        self.on_disconnect = None
+
+    def username_pw_set(self, username: str, password: str | None) -> None:
+        del username, password
+
+    def tls_set(self, ca_certs: str | None = None) -> None:
+        del ca_certs
+
+    def max_queued_messages_set(self, count: int) -> None:
+        del count
+
+    def max_inflight_messages_set(self, count: int) -> None:
+        del count
+
+    def reconnect_delay_set(self, min_delay: int, max_delay: int) -> None:
+        del min_delay, max_delay
+
+    def will_set(self, topic: str, payload: str, qos: int, retain: bool) -> None:
+        del topic, payload, qos, retain
+
+    def publish(
+        self,
+        topic: str,
+        payload: str,
+        qos: int,
+        retain: bool,
+    ) -> _FakePublishInfo:
+        self.published.append((topic, payload, qos, retain))
+        return _FakePublishInfo()
+
+    def connect_async(self, host: str, port: int, keepalive: int) -> None:
+        del host, port, keepalive
+
+    def loop_start(self) -> None:
+        pass
+
+    def loop_stop(self) -> None:
+        pass
+
+    def disconnect(self) -> None:
+        pass
+
+
+class _FakeMqttModule:
+    MQTT_ERR_SUCCESS = 0
+    MQTTv311 = 4
+
+    class CallbackAPIVersion:
+        VERSION2 = 2
+
+    def Client(self, *args: object, **kwargs: object) -> _FakeMqttClient:
+        del args, kwargs
+        return _FakeMqttClient()
 
 
 if __name__ == "__main__":

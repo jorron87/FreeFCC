@@ -1,0 +1,66 @@
+{
+  "schema": "duml-lab/v1",
+  "name": "40007 wrapped version keepalive",
+  "port": 40007,
+  "connect_timeout_ms": 2000,
+  "total_timeout_ms": 10000,
+  "max_rx_bytes": 262144,
+  "setup": [
+    {
+      "op": "connect",
+      "label": "open one persistent socket"
+    },
+    {
+      "op": "write_duml",
+      "label": "initial version inquiry",
+      "sender": 2,
+      "destination": 6,
+      "cmd_type": 0,
+      "cmd_set": 0,
+      "cmd_id": 1,
+      "payload_b64": "",
+      "wire": "wrapped_40007"
+    }
+  ],
+  "cycle": [
+    {
+      "op": "read",
+      "label": "first idle window",
+      "duration_ms": 500,
+      "idle_timeout_ms": 20,
+      "max_bytes": 32768
+    },
+    {
+      "op": "read",
+      "label": "second idle window",
+      "duration_ms": 500,
+      "idle_timeout_ms": 20,
+      "max_bytes": 32768
+    },
+    {
+      "op": "write_duml",
+      "label": "fresh version keepalive",
+      "sender": 2,
+      "destination": 6,
+      "cmd_type": 0,
+      "cmd_set": 0,
+      "cmd_id": 1,
+      "payload_b64": "",
+      "wire": "wrapped_40007"
+    }
+  ],
+  "cycle_count": 40,
+  "teardown": [
+    {
+      "op": "read",
+      "label": "bounded final drain",
+      "duration_ms": 500,
+      "idle_timeout_ms": 100,
+      "max_bytes": 32768
+    },
+    {
+      "op": "close",
+      "label": "explicit close"
+    }
+  ]
+}

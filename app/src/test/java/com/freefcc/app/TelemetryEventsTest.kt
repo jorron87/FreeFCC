@@ -1,6 +1,7 @@
 package com.freefcc.app
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -73,13 +74,15 @@ class TelemetryEventsTest {
             ),
             appVersion = "test",
             controllerModel = "rc331",
-            controllerIdentity = ControllerIdentity("RC123H103", "Build.getSerial")
+            controllerIdentity = ControllerIdentity("RC123H103", "Build.getSerial"),
+            elapsedRealtimeNs = 123_000_000
         ).toJsonLine()
 
         assertTrue(line.contains("\"source_mode\":\"bench_wrapped_socket\""))
         assertTrue(line.contains("\"source_port\":40007"))
         assertTrue(line.contains("\"controller_serial\":\"RC123H103\""))
         assertTrue(line.contains("\"controller_serial_source\":\"Build.getSerial\""))
+        assertTrue(line.contains("\"elapsed_realtime_ns\":123000000"))
     }
 
     @Test
@@ -103,7 +106,7 @@ class TelemetryEventsTest {
     }
 
     @Test
-    fun `hello records same socket primer policy`() {
+    fun `hello records same socket stream keepalive policy`() {
         val line = TelemetryHelloEvent(
             sessionId = "session-3",
             config = TelemetryConfig(
@@ -111,15 +114,52 @@ class TelemetryEventsTest {
                 port = 8765,
                 sourceId = "neo2",
                 capturePort = 40007,
-                primerEnabled = true
+                streamKeepaliveEnabled = true
             ),
             appVersion = "test",
             controllerModel = "rc331"
         ).toJsonLine()
 
-        assertTrue(line.contains("\"source_mode\":\"bench_wrapped_primed\""))
-        assertTrue(line.contains("\"source_policy\":\"same_socket_1hz_03_44_no_reconnect\""))
-        assertTrue(line.contains("\"primer_enabled\":true"))
+        assertTrue(line.contains("\"source_mode\":\"bench_wrapped_keepalive\""))
+        assertTrue(line.contains("\"source_policy\":\"same_socket_idle_00_01_no_reconnect\""))
+        assertTrue(line.contains("\"stream_keepalive_enabled\":true"))
+    }
+
+    @Test
+    fun `hello records explicitly armed control only lab policy`() {
+        val line = TelemetryHelloEvent(
+            sessionId = "session-lab",
+            config = TelemetryConfig(
+                host = "192.168.5.99",
+                port = 8765,
+                sourceId = "neo2",
+                capturePort = CONTROL_ONLY_PORT
+            ),
+            appVersion = "test",
+            controllerModel = "rc331"
+        ).toJsonLine()
+
+        assertTrue(line.contains("\"source_mode\":\"duml_lab_control_only\""))
+        assertTrue(line.contains("\"source_port\":0"))
+        assertTrue(line.contains("\"source_policy\":\"remote_bounded_recipes_no_capture\""))
+    }
+
+    @Test
+    fun `stream keepalive stats preserve command and cadence evidence`() {
+        val line = StreamKeepaliveStatsEvent(
+            sessionId = "session-4",
+            elapsedRealtimeNs = 5_000_000_000,
+            source = "bench_wrapped_keepalive",
+            port = 40007,
+            sentCount = 17,
+            readTimeoutMs = 20,
+            idleTimeoutsBeforeSend = 2
+        ).toJsonLine()
+
+        assertTrue(line.contains("\"type\":\"STREAM_KEEPALIVE_STATS\""))
+        assertTrue(line.contains("\"sent_count\":17"))
+        assertTrue(line.contains("\"command_family\":\"00/01\""))
+        assertTrue(line.contains("\"route\":\"02>06\""))
     }
 
     @Test
@@ -137,6 +177,29 @@ class TelemetryEventsTest {
         assertTrue(line.contains("\"type\":\"TELEMETRY_TICK\""))
         assertTrue(line.contains("\"last_byte_age_ms\":12"))
         assertTrue(line.contains("\"source_clock_ms\":77"))
+    }
+
+    @Test
+    fun `relay serialization freezes capture wall time before reconnect backlog`() {
+        val event = TelemetryTickEvent(
+            sessionId = "session-queue",
+            source = "bench_wrapped_keepalive",
+            port = 40007,
+            elapsedRealtimeNs = 9_000_000_000,
+            sourceStatus = "active",
+            lastByteAgeMs = 4,
+            sourceClockMs = null
+        )
+
+        val serialized = serializeTelemetryEvent(event)
+        Thread.sleep(20)
+        val laterSerialization = event.toJsonLine()
+
+        assertNotEquals(laterSerialization, serialized.line)
+        assertEquals(
+            serialized.line.toByteArray(Charsets.UTF_8).size.toLong() + 1L,
+            serialized.bytes
+        )
     }
 
     @Test

@@ -1,0 +1,30 @@
+{
+  "schema": "duml-lab/v1",
+  "name": "8902 passive observation",
+  "port": 8902,
+  "connect_timeout_ms": 2000,
+  "total_timeout_ms": 10000,
+  "max_rx_bytes": 262144,
+  "setup": [
+    {
+      "op": "connect",
+      "label": "open passive socket"
+    }
+  ],
+  "cycle": [
+    {
+      "op": "read",
+      "label": "observe without writes",
+      "duration_ms": 1000,
+      "idle_timeout_ms": 250,
+      "max_bytes": 65536
+    }
+  ],
+  "cycle_count": 20,
+  "teardown": [
+    {
+      "op": "close",
+      "label": "explicit close"
+    }
+  ]
+}

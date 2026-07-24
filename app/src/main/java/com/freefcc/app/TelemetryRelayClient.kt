@@ -1,5 +1,6 @@
 package com.freefcc.app
 
+import android.os.SystemClock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -16,7 +17,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import org.json.JSONObject
 
-sealed interface TelemetryRelayCommand {
+internal sealed interface TelemetryRelayCommand {
     val requestId: String
 
     data class Probe(override val requestId: String) : TelemetryRelayCommand
@@ -33,9 +34,24 @@ sealed interface TelemetryRelayCommand {
         val readWindowMs: Int,
         val port: Int
     ) : TelemetryRelayCommand
+
+    data class DumlLab(
+        override val requestId: String,
+        val recipe: DumlLabRecipe
+    ) : TelemetryRelayCommand
 }
 
-class TelemetryRelayClient(
+internal data class SerializedTelemetryEvent(val line: String, val bytes: Long)
+
+internal fun serializeTelemetryEvent(event: TelemetryEvent): SerializedTelemetryEvent {
+    val line = event.toJsonLine()
+    return SerializedTelemetryEvent(
+        line = line,
+        bytes = line.toByteArray(Charsets.UTF_8).size.toLong() + 1L
+    )
+}
+
+internal class TelemetryRelayClient(
     private val config: TelemetryConfig,
     private val sessionId: String,
     private val appVersion: String,
@@ -46,9 +62,7 @@ class TelemetryRelayClient(
     private val onCommand: (TelemetryRelayCommand) -> Unit,
     private val onFatal: (String) -> Unit
 ) {
-    private data class QueuedEvent(val event: TelemetryEvent, val bytes: Long)
-
-    private val queue = ArrayBlockingQueue<QueuedEvent>(MAX_QUEUE_EVENTS)
+    private val queue = ArrayBlockingQueue<SerializedTelemetryEvent>(MAX_QUEUE_EVENTS)
     private val queuedBytes = AtomicLong(0)
     private var writerJob: Job? = null
 
@@ -64,6 +78,7 @@ class TelemetryRelayClient(
                     socket = connectedSocket
                     connectedSocket.connect(InetSocketAddress(config.host, config.port), CONNECT_TIMEOUT_MS)
                     connectedSocket.tcpNoDelay = true
+                    connectedSocket.keepAlive = true
                     val writer = BufferedWriter(OutputStreamWriter(connectedSocket.getOutputStream(), Charsets.UTF_8))
                     onStatus(
                         TelemetryStatus(
@@ -82,8 +97,9 @@ class TelemetryRelayClient(
                             config,
                             appVersion,
                             controllerModel,
-                            controllerIdentity
-                        )
+                            controllerIdentity,
+                            SystemClock.elapsedRealtimeNanos()
+                        ).toJsonLine()
                     )
                     val readerJob = scope.launch(Dispatchers.IO) {
                         try {
@@ -96,11 +112,25 @@ class TelemetryRelayClient(
                             try { connectedSocket.close() } catch (_: Exception) {}
                         }
                     }
+                    var lastHeartbeatElapsedMs = SystemClock.elapsedRealtime()
                     while (isActive && !connectedSocket.isClosed) {
-                        val queued = queue.poll(500, TimeUnit.MILLISECONDS) ?: continue
-                        queuedBytes.addAndGet(-queued.bytes)
-                        writeLine(writer, queued.event)
-                        onStatus(TelemetryStatus(relayConnected = true, queueDepth = queue.size))
+                        val queued = queue.poll(500, TimeUnit.MILLISECONDS)
+                        if (queued != null) {
+                            queuedBytes.addAndGet(-queued.bytes)
+                            writeLine(writer, queued.line)
+                            onStatus(TelemetryStatus(relayConnected = true, queueDepth = queue.size))
+                        }
+                        val nowElapsedMs = SystemClock.elapsedRealtime()
+                        if (nowElapsedMs - lastHeartbeatElapsedMs >= RELAY_HEARTBEAT_INTERVAL_MS) {
+                            writeLine(
+                                writer,
+                                TelemetryRelayHeartbeatEvent(
+                                    sessionId = sessionId,
+                                    elapsedRealtimeNs = SystemClock.elapsedRealtimeNanos()
+                                ).toJsonLine()
+                            )
+                            lastHeartbeatElapsedMs = nowElapsedMs
+                        }
                     }
                     readerJob.cancel()
                 } catch (e: Exception) {
@@ -122,16 +152,16 @@ class TelemetryRelayClient(
     }
 
     fun enqueue(event: TelemetryEvent): Boolean {
-        val bytes = event.toJsonLine().toByteArray(Charsets.UTF_8).size.toLong() + 1L
-        val totalBytes = queuedBytes.addAndGet(bytes)
+        val serialized = serializeTelemetryEvent(event)
+        val totalBytes = queuedBytes.addAndGet(serialized.bytes)
         if (totalBytes > MAX_QUEUE_BYTES) {
-            queuedBytes.addAndGet(-bytes)
+            queuedBytes.addAndGet(-serialized.bytes)
             onFatal("Telemetry relay byte queue full; stopping to avoid stale metadata")
             return false
         }
-        val accepted = queue.offer(QueuedEvent(event, bytes))
+        val accepted = queue.offer(serialized)
         if (!accepted) {
-            queuedBytes.addAndGet(-bytes)
+            queuedBytes.addAndGet(-serialized.bytes)
             onFatal("Telemetry relay queue full; stopping to avoid stale metadata")
         } else {
             onStatus(TelemetryStatus(queueDepth = queue.size))
@@ -139,8 +169,8 @@ class TelemetryRelayClient(
         return accepted
     }
 
-    private fun writeLine(writer: BufferedWriter, event: TelemetryEvent) {
-        writer.write(event.toJsonLine())
+    private fun writeLine(writer: BufferedWriter, line: String) {
+        writer.write(line)
         writer.newLine()
         writer.flush()
     }
@@ -168,6 +198,22 @@ class TelemetryRelayClient(
                     enqueueDumlRejected(requestId, "Invalid or oversized DUML request")
                 } else {
                     onCommand(command)
+                }
+            }
+            "DUML_LAB_REQUEST" -> {
+                if (config.sourceMode != TelemetrySourceMode.DumlLabControlOnly) {
+                    enqueueDumlLabRejected(
+                        requestId,
+                        "Select Lab only and restart the relay before running arbitrary recipes"
+                    )
+                    return
+                }
+                val parsed = DumlLabRecipeParser.parse(obj)
+                val recipe = parsed.recipe
+                if (recipe == null) {
+                    enqueueDumlLabRejected(requestId, parsed.error.ifBlank { "Invalid DUML Lab recipe" })
+                } else {
+                    onCommand(TelemetryRelayCommand.DumlLab(requestId, recipe))
                 }
             }
             else -> enqueueRejected(requestId, "Unknown relay command type")
@@ -225,10 +271,21 @@ class TelemetryRelayClient(
         )
     }
 
+    private fun enqueueDumlLabRejected(requestId: String, message: String) {
+        enqueue(
+            TelemetryDumlLabRejectedEvent(
+                sessionId = sessionId,
+                requestId = requestId,
+                message = message
+            )
+        )
+    }
+
     companion object {
         private const val CONNECT_TIMEOUT_MS = 2_000
         private const val MAX_QUEUE_EVENTS = 512
         private const val MAX_QUEUE_BYTES = 8L * 1024 * 1024
+        private const val RELAY_HEARTBEAT_INTERVAL_MS = 5_000L
         private const val ALLOWED_PROBE = "fc_osd_03_43_once"
         private const val MAX_REMOTE_PAYLOAD_BYTES = 512
         val RESEARCH_DUML_PORTS = setOf(40009, 40007, 8901, 8902, 8903, 8904)
@@ -246,6 +303,7 @@ data class TelemetryStatus(
     val captureActive: Boolean? = null,
     val rawChunks: Long? = null,
     val frames: Long? = null,
+    val keepalives: Long? = null,
     val records: Long? = null,
     val parserErrors: Long? = null,
     val bytes: Long? = null,
@@ -264,6 +322,7 @@ data class TelemetryRuntimeState(
     val captureActive: Boolean = false,
     val rawChunks: Long = 0,
     val frames: Long = 0,
+    val keepalives: Long = 0,
     val records: Long = 0,
     val parserErrors: Long = 0,
     val bytes: Long = 0,
@@ -281,6 +340,7 @@ data class TelemetryRuntimeState(
         captureActive = status.captureActive ?: captureActive,
         rawChunks = status.rawChunks ?: rawChunks,
         frames = status.frames ?: frames,
+        keepalives = status.keepalives ?: keepalives,
         records = status.records ?: records,
         parserErrors = status.parserErrors ?: parserErrors,
         bytes = status.bytes ?: bytes,

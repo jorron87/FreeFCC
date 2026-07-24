@@ -8,19 +8,23 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
 import java.util.zip.CRC32
+import org.json.JSONArray
+import org.json.JSONObject
 
 enum class TelemetrySourceMode(val wireName: String) {
+    DumlLabControlOnly("duml_lab_control_only"),
     Rc2PublishStream("rc2_publish_8902"),
-    BenchWrappedPrimed("bench_wrapped_primed"),
+    BenchWrappedKeepalive("bench_wrapped_keepalive"),
     BenchWrappedSocket("bench_wrapped_socket"),
     BenchDirectSocket("bench_direct_socket");
 
     companion object {
-        fun forPort(port: Int, primerEnabled: Boolean = false): TelemetrySourceMode =
+        fun forPort(port: Int, streamKeepaliveEnabled: Boolean = false): TelemetrySourceMode =
             when (port) {
+                CONTROL_ONLY_PORT -> DumlLabControlOnly
                 DumlTransport.PORT_ALT_2 -> Rc2PublishStream
-                DumlTransport.PORT_LED -> if (primerEnabled) {
-                    BenchWrappedPrimed
+                DumlTransport.PORT_LED -> if (streamKeepaliveEnabled) {
+                    BenchWrappedKeepalive
                 } else {
                     BenchWrappedSocket
                 }
@@ -34,8 +38,8 @@ data class TelemetryConfig(
     val port: Int,
     val sourceId: String,
     val capturePort: Int = DumlTransport.PORT_ALT_2,
-    val primerEnabled: Boolean = false,
-    val sourceMode: TelemetrySourceMode = TelemetrySourceMode.forPort(capturePort, primerEnabled),
+    val streamKeepaliveEnabled: Boolean = false,
+    val sourceMode: TelemetrySourceMode = TelemetrySourceMode.forPort(capturePort, streamKeepaliveEnabled),
     val rawRelayEnabled: Boolean = true,
     val sampleIntervalMs: Long = 1_000,
     val controllerFirmware: String = "",
@@ -53,7 +57,8 @@ data class TelemetryHelloEvent(
     val config: TelemetryConfig,
     val appVersion: String,
     val controllerModel: String,
-    val controllerIdentity: ControllerIdentity = ControllerIdentity(null, null)
+    val controllerIdentity: ControllerIdentity = ControllerIdentity(null, null),
+    val elapsedRealtimeNs: Long = 0
 ) : TelemetryEvent("HELLO") {
     override fun toJsonLine(): String = jsonObject(
         "type" to type,
@@ -63,11 +68,12 @@ data class TelemetryHelloEvent(
         "source_mode" to config.sourceMode.wireName,
         "source_port" to config.capturePort,
         "source_policy" to when (config.sourceMode) {
+            TelemetrySourceMode.DumlLabControlOnly -> "remote_bounded_recipes_no_capture"
             TelemetrySourceMode.Rc2PublishStream -> "persistent_read_only"
-            TelemetrySourceMode.BenchWrappedPrimed -> "same_socket_1hz_03_44_no_reconnect"
+            TelemetrySourceMode.BenchWrappedKeepalive -> "same_socket_idle_00_01_no_reconnect"
             else -> "explicit_single_connection"
         },
-        "primer_enabled" to config.primerEnabled,
+        "stream_keepalive_enabled" to config.streamKeepaliveEnabled,
         "raw_relay_enabled" to config.rawRelayEnabled,
         "sample_interval_ms" to config.sampleIntervalMs,
         "source_id" to config.sourceId,
@@ -79,6 +85,7 @@ data class TelemetryHelloEvent(
         "aircraft_model" to config.aircraftModel,
         "aircraft_firmware" to config.aircraftFirmware,
         "device" to (Build.DEVICE ?: "unknown"),
+        "elapsed_realtime_ns" to elapsedRealtimeNs,
         "created_at" to utcNow()
     )
 }
@@ -194,6 +201,31 @@ data class Rc2RecordStatsEvent(
     )
 }
 
+data class StreamKeepaliveStatsEvent(
+    val sessionId: String,
+    val elapsedRealtimeNs: Long,
+    val source: String,
+    val port: Int,
+    val sentCount: Long,
+    val readTimeoutMs: Int,
+    val idleTimeoutsBeforeSend: Int
+) : TelemetryEvent("STREAM_KEEPALIVE_STATS") {
+    override fun toJsonLine(): String = jsonObject(
+        "type" to type,
+        "schema" to TELEMETRY_SCHEMA,
+        "session_id" to sessionId,
+        "wall_time_utc" to utcNow(),
+        "elapsed_realtime_ns" to elapsedRealtimeNs,
+        "source" to source,
+        "port" to port,
+        "sent_count" to sentCount,
+        "read_timeout_ms" to readTimeoutMs,
+        "idle_timeouts_before_send" to idleTimeoutsBeforeSend,
+        "command_family" to "00/01",
+        "route" to "02>06"
+    )
+}
+
 data class TelemetryCandidateEvent(
     val sessionId: String,
     val sourceId: String,
@@ -230,6 +262,19 @@ data class TelemetryErrorEvent(
     )
 }
 
+data class TelemetryRelayHeartbeatEvent(
+    val sessionId: String,
+    val elapsedRealtimeNs: Long
+) : TelemetryEvent("RELAY_HEARTBEAT") {
+    override fun toJsonLine(): String = jsonObject(
+        "type" to type,
+        "schema" to TELEMETRY_SCHEMA,
+        "session_id" to sessionId,
+        "captured_at" to utcNow(),
+        "elapsed_realtime_ns" to elapsedRealtimeNs
+    )
+}
+
 data class TelemetryProbeResultEvent(
     val sessionId: String,
     val requestId: String,
@@ -247,7 +292,7 @@ data class TelemetryProbeResultEvent(
     }
 }
 
-data class TelemetryDumlResultEvent(
+internal data class TelemetryDumlResultEvent(
     val sessionId: String,
     val requestId: String,
     val command: TelemetryRelayCommand.Duml,
@@ -277,6 +322,108 @@ data class TelemetryDumlRejectedEvent(
     )
 }
 
+internal data class TelemetryDumlLabResultEvent(
+    val sessionId: String,
+    val requestId: String,
+    val recipe: DumlLabRecipe,
+    val result: DumlLabExecutionResult
+) : TelemetryEvent("DUML_LAB_RESULT") {
+    override fun toJsonLine(): String {
+        val steps = JSONArray()
+        result.steps.forEach { step ->
+            steps.put(
+                JSONObject()
+                    .put("index", step.index)
+                    .put("phase", step.phase)
+                    .put("cycle", step.cycle ?: JSONObject.NULL)
+                    .put("op", step.op)
+                    .put("label", step.label)
+                    .put("status", step.status)
+                    .put("duration_ms", step.durationMs)
+                    .put("byte_count", step.bytes?.size ?: 0)
+                    .put(
+                        "bytes_b64",
+                        step.bytes?.let { Base64.getEncoder().encodeToString(it) } ?: JSONObject.NULL
+                    )
+                    .put("message", step.message)
+            )
+        }
+        val frames = JSONArray()
+        result.frames.forEach { observed ->
+            frames.put(
+                JSONObject()
+                    .put("phase", observed.phase)
+                    .put("cycle", observed.cycle ?: JSONObject.NULL)
+                    .put("step_index", observed.stepIndex)
+                    .put("direction", observed.direction)
+                    .put("sender", observed.frame.sender)
+                    .put("receiver", observed.frame.receiver)
+                    .put("sequence", observed.frame.sequence)
+                    .put("cmd_type", observed.frame.cmdType)
+                    .put("cmd_set", observed.frame.cmdSet)
+                    .put("cmd_id", observed.frame.cmdId)
+                    .put("payload_length", observed.frame.payloadLength)
+                    .put("validation_status", observed.frame.validationStatus)
+                    .put(
+                        "raw_frame_b64",
+                        Base64.getEncoder().encodeToString(observed.frame.raw)
+                    )
+            )
+        }
+        val errors = JSONArray()
+        result.parserErrors.forEach { observed ->
+            errors.put(
+                JSONObject()
+                    .put("phase", observed.phase)
+                    .put("cycle", observed.cycle ?: JSONObject.NULL)
+                    .put("step_index", observed.stepIndex)
+                    .put("direction", observed.direction)
+                    .put("reason", observed.error.reason)
+                    .put("byte_offset", observed.error.byteOffset)
+                    .put("detail", observed.error.detail)
+            )
+        }
+        return JSONObject()
+            .put("type", type)
+            .put("schema", TELEMETRY_SCHEMA)
+            .put("session_id", sessionId)
+            .put("request_id", requestId)
+            .put("captured_at", utcNow())
+            .put("safety", "bench_only_bounded_loopback")
+            .put("status", result.status)
+            .put("terminal_reason", result.terminalReason)
+            .put("message", result.message)
+            .put("duration_ms", result.durationMs)
+            .put("connections_opened", result.connectionsOpened)
+            .put("tx_bytes", result.txBytes)
+            .put("rx_bytes", result.rxBytes)
+            .put("recipe", recipe.toJsonObject())
+            .put("steps", steps)
+            .put("frames", frames)
+            .put("parser_errors", errors)
+            .put("dropped_frame_diagnostics", result.droppedFrames)
+            .put("dropped_parser_error_diagnostics", result.droppedParserErrors)
+            .toString()
+    }
+}
+
+data class TelemetryDumlLabRejectedEvent(
+    val sessionId: String,
+    val requestId: String,
+    val message: String
+) : TelemetryEvent("DUML_LAB_RESULT") {
+    override fun toJsonLine(): String = jsonObject(
+        "type" to type,
+        "schema" to TELEMETRY_SCHEMA,
+        "session_id" to sessionId,
+        "request_id" to requestId,
+        "captured_at" to utcNow(),
+        "safety" to "bench_only_bounded_loopback",
+        "status" to "rejected",
+        "message" to message
+    )
+}
+
 fun newTelemetrySessionId(): String = UUID.randomUUID().toString()
 
 fun crc32Hex(bytes: ByteArray): String {
@@ -286,6 +433,7 @@ fun crc32Hex(bytes: ByteArray): String {
 }
 
 internal const val TELEMETRY_SCHEMA = "dji-rc2-telemetry/v2"
+internal const val CONTROL_ONLY_PORT = 0
 
 private fun b64(bytes: ByteArray): String = Base64.getEncoder().encodeToString(bytes)
 

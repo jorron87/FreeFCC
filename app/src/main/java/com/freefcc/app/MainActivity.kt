@@ -194,6 +194,8 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 StatusDot(
                     when {
                         runtime.running && runtime.relayConnected && runtime.captureActive -> Green
+                        runtime.running && runtime.relayConnected &&
+                            runtime.sourceMode == "duml_lab_control_only" -> Green
                         runtime.running && runtime.relayConnected -> Amber
                         runtime.running || runtime.connecting -> Amber
                         runtime.lastError.isNotEmpty() -> Red
@@ -205,6 +207,8 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                     Text(
                         when {
                             runtime.running && runtime.relayConnected && runtime.captureActive -> "Streaming to Mac"
+                            runtime.running && runtime.relayConnected &&
+                                runtime.sourceMode == "duml_lab_control_only" -> "DUML Lab ready"
                             runtime.running && runtime.relayConnected -> "Relay connected; capture stopped"
                             runtime.running || runtime.connecting -> "Starting relay"
                             runtime.lastError.isNotEmpty() -> "Stopped fail-closed"
@@ -226,7 +230,11 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
 
             Spacer(Modifier.height(16.dp))
             BodyText(
-                "One explicit source connection. Primed 40007 sends one 03/44 refresh per second on the same socket; EOF and write failures stop without reconnect.",
+                if (runtime.sourceMode == "duml_lab_control_only") {
+                    "Mac-controlled bounded DUML recipes; no controller capture port is held."
+                } else {
+                    "One explicit source connection. Keepalive 40007 sends an idle-based 00/01 version inquiry on the same socket; EOF and write failures stop without reconnect."
+                },
                 Amber
             )
 
@@ -240,6 +248,8 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
             }
             Spacer(Modifier.height(12.dp))
             InfoRow("Source", runtime.sourceStatus.uppercase(), if (runtime.sourceStatus == "active") Green else Amber)
+            Spacer(Modifier.height(8.dp))
+            InfoRow("Keepalives", runtime.keepalives.toString(), TextWhite)
             Spacer(Modifier.height(8.dp))
             InfoRow("Records", runtime.records.toString(), TextWhite)
         }
@@ -273,22 +283,23 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 enabled = !runtime.running
             )
             Spacer(Modifier.height(14.dp))
-            Text("Read-only source", color = TextGray, fontSize = 12.sp)
+            Text("Metadata source", color = TextGray, fontSize = 12.sp)
             Spacer(Modifier.height(8.dp))
             SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                 listOf(
-                    Triple("8902 Passive", 8902, false),
-                    Triple("40007 Primed", 40007, true),
-                    Triple("40007 Snapshot", 40007, false)
+                    Triple("Lab", CONTROL_ONLY_PORT, false),
+                    Triple("8902", 8902, false),
+                    Triple("40007 KA", 40007, true),
+                    Triple("40007 Snap", 40007, false)
                 ).forEachIndexed { index, choice ->
                     SegmentedButton(
                         selected = state.telemetryCapturePort == choice.second.toString() &&
-                            state.telemetryPrimerEnabled == choice.third,
+                            state.telemetryStreamKeepaliveEnabled == choice.third,
                         onClick = { viewModel.selectTelemetrySource(choice.second, choice.third) },
-                        shape = SegmentedButtonDefaults.itemShape(index, 3),
+                        shape = SegmentedButtonDefaults.itemShape(index, 4),
                         enabled = !runtime.running
                     ) {
-                        Text(choice.first, fontSize = 11.sp)
+                        Text(choice.first, fontSize = 10.sp)
                     }
                 }
             }
@@ -302,12 +313,14 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
             )
             Spacer(Modifier.height(8.dp))
             BodyText(
-                if (state.telemetryPrimerEnabled) {
-                    "ACTIVE BENCH: 1 Hz 03/44, same socket, no reconnect."
+                if (state.telemetryCapturePort == CONTROL_ONLY_PORT.toString()) {
+                    "CONTROL ONLY: relay stays alive while every DJI localhost port remains free for DUML Lab."
+                } else if (state.telemetryStreamKeepaliveEnabled) {
+                    "ACTIVE BENCH: idle-based 00/01 keepalive, same socket, no reconnect."
                 } else {
                     "Passive source; no writes or automatic reconnect."
                 },
-                if (state.telemetryPrimerEnabled) Amber else TextDim
+                if (state.telemetryStreamKeepaliveEnabled) Amber else TextDim
             )
             Spacer(Modifier.height(18.dp))
             if (runtime.running) {
@@ -358,10 +371,10 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
         Spacer(Modifier.height(16.dp))
 
         GlowCard {
-            Text("Bench probe", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Text("DUML Lab", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(10.dp))
             BodyText(
-                "Sends one read-only 03/43 request on 40009. Mac-local control may issue any bounded structured DUML command on a selected supported port. A port held by capture is rejected instead of reconnecting it.",
+                "Mac-local control can run bounded direct, wrapped or raw recipes on any localhost port. A port held by capture is rejected.",
                 Amber
             )
             Spacer(Modifier.height(14.dp))

@@ -1,0 +1,41 @@
+{
+  "schema": "duml-lab/v1",
+  "name": "40009 single structured DUML request",
+  "port": 40009,
+  "connect_timeout_ms": 2000,
+  "total_timeout_ms": 5000,
+  "max_rx_bytes": 65536,
+  "setup": [
+    {
+      "op": "connect",
+      "label": "open transaction socket"
+    },
+    {
+      "op": "write_duml",
+      "label": "edit route command and payload here",
+      "sender": 130,
+      "destination": 3,
+      "cmd_type": 64,
+      "cmd_set": 3,
+      "cmd_id": 87,
+      "payload_b64": "",
+      "wire": "direct"
+    }
+  ],
+  "cycle": [
+    {
+      "op": "read",
+      "label": "bounded response and broadcasts",
+      "duration_ms": 1500,
+      "idle_timeout_ms": 250,
+      "max_bytes": 65536
+    }
+  ],
+  "cycle_count": 1,
+  "teardown": [
+    {
+      "op": "close",
+      "label": "explicit close"
+    }
+  ]
+}

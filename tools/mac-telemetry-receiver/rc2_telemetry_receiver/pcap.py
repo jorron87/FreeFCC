@@ -2,11 +2,7 @@ from __future__ import annotations
 
 import io
 import struct
-import subprocess
 from collections.abc import Iterator
-from pathlib import Path
-
-from .receiver import handle_payload_stream
 
 
 LINKTYPE_NULL = 0
@@ -111,29 +107,3 @@ def _ip_packet(packet: bytes, linktype: int) -> bytes | None:
             return None
         return packet[20:]
     return None
-
-
-def adb_pcap(out_root: Path, adb: str = "adb") -> None:
-    cmd = [
-        adb,
-        "exec-out",
-        "tcpdump",
-        "-i",
-        "lo",
-        "-s",
-        "0",
-        "-U",
-        "-w",
-        "-",
-        "tcp port 40009",
-    ]
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE) as proc:
-        if proc.stdout is None:
-            raise RuntimeError("adb stdout unavailable")
-        payloads = iter_pcap_tcp_payloads(proc.stdout, port=40009)
-        handle_payload_stream(
-            payloads=payloads,
-            out_root=out_root,
-            session_id=f"adb-pcap-{proc.pid}",
-            source="passive_pcap_adb",
-        )
