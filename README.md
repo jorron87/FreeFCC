@@ -180,7 +180,7 @@ Each command is a small binary packet with a magic byte (`0x55`), a header with 
 
 This fork adds a separate Telemetry tab for raw metadata research. It can stream `RAW_CHUNK` and validated `DUML_FRAME` NDJSON records to a local Mac on port `8765`.
 
-`1.5.3-research.11` defaults to the read-only RC2 publish endpoint
+`1.5.3-research.12` defaults to the read-only RC2 publish endpoint
 `127.0.0.1:8902`. One socket remains open for the explicit session, the app
 sends no bytes to that endpoint, and a `TELEMETRY_TICK` produces one Mac-side
 `GEOREFERENCE_SAMPLE` per second. A connected but silent endpoint is reported
@@ -225,6 +225,15 @@ Select `Lab only` in the Telemetry tab to keep the foreground relay connected
 without reserving a controller capture port. The LAN relay emits a five-second
 heartbeat that never touches DJI hardware. This makes every localhost port
 available to a Mac-authored recipe without another APK build.
+
+While `Lab only` is active, the existing DJI Fly Accessibility service also
+captures a bounded view of the active DJI Fly accessibility tree once per
+second. `DJI_FLY_UI_SNAPSHOT` records contain visible labels and descriptions,
+their original RC monotonic capture time, node count and truncation state.
+They are local research observations with `semantics=unparsed`; they are never
+promoted to position, height, heading or gimbal metadata automatically. The
+service visits at most 300 nodes and relays at most 80 labels / 1,500
+characters per snapshot. It opens no DJI socket.
 
 Physical bench status from 2026-07-22/23: the earlier relay streamed over LAN
 while DJI Fly remained connected on the tested RC2, and the final `research.3`
@@ -296,8 +305,16 @@ the idle socket after roughly two seconds and a rapid second write reset it.
 The one-command-per-connection Lab recipe then completed three one-hertz
 snapshots while DJI Fly was open: three connections, 63 TX bytes, 6,026 RX
 bytes, CRC-valid frames in every window, and no parser error or reset.
-`research.11` implements that exact transport contract. Sustained delivery and
-zero DJI Fly link warnings over a longer run remain physical gates.
+`research.11` implemented that exact transport contract. A later 20-second
+soak completed 20/20 connections and decoded repeated `03/43` and `04/05`, but
+DJI Fly's own telemetry disappeared once per second. `40007 1Hz` is therefore
+rejected as a flight-safe source on this RC2/Neo 2 combination.
+
+Direct `40009` remained compatible with DJI Fly but exposed only a narrow RC
+stream without the required flight/gimbal families. Controller port `8902`
+accepted a LAN connection but stayed byte-silent in foreground, DJI Fly and
+handoff tests. `research.12` therefore keeps `Lab only` as the non-invasive
+runtime and adds the Accessibility UI snapshot stream for live label discovery.
 
 The Mac receiver now emits one field-freshness-controlled
 `GEOREFERENCE_SAMPLE` per second. AMSL from candidate `03/57` and takeoff
@@ -320,7 +337,7 @@ and periodic `07/19`/`07/30` country traffic does not improve metadata capture.
 The structured RM510 `51/14` layout is the relevant change adopted in this
 release.
 
-Current research build: `1.5.3-research.11`. It remains bench-only until its
+Current research build: `1.5.3-research.12`. It remains bench-only until its
 physical RC2 gate has passed. See
 [`docs/TELEMETRY_ARCHITECTURE.md`](docs/TELEMETRY_ARCHITECTURE.md) for the
 transport boundary and acceptance gates.

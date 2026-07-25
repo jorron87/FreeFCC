@@ -284,6 +284,28 @@ data class TelemetryRelayHeartbeatEvent(
     )
 }
 
+internal data class DjiFlyUiSnapshotEvent(
+    val sessionId: String,
+    val snapshot: DjiFlyUiSnapshot
+) : TelemetryEvent("DJI_FLY_UI_SNAPSHOT") {
+    override fun toJsonLine(): String = JSONObject()
+        .put("type", type)
+        .put("schema", TELEMETRY_SCHEMA)
+        .put("session_id", sessionId)
+        .put("source", "dji_fly_accessibility")
+        .put("captured_at", snapshot.capturedAtUtc)
+        .put("elapsed_realtime_ns", snapshot.elapsedRealtimeNs)
+        .put("snapshot_seq", snapshot.sequence)
+        .put("event_type", snapshot.eventType)
+        .put("package", "dji.go.v5")
+        .put("labels", JSONArray(snapshot.labels))
+        .put("node_count", snapshot.visitedNodeCount)
+        .put("truncated", snapshot.truncated)
+        .put("quality", "ui_observation")
+        .put("semantics", "unparsed")
+        .toString()
+}
+
 data class TelemetryProbeResultEvent(
     val sessionId: String,
     val requestId: String,

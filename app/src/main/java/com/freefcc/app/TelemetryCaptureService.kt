@@ -157,6 +157,7 @@ class TelemetryCaptureService : Service() {
 
         if (config.sourceMode == TelemetrySourceMode.DumlLabControlOnly) {
             sourceStatus = "control_only"
+            val uiSnapshotSequenceAtStart = DjiFlyUiSnapshotBus.beginCapture()
             TelemetryStatusBus.update(
                 TelemetryStatus(
                     connecting = true,
@@ -168,8 +169,11 @@ class TelemetryCaptureService : Service() {
             emitSourceStatus(
                 config,
                 sourceStatus,
-                "DUML Lab ready; no controller capture port is held"
+                "DUML Lab ready; DJI Fly UI snapshots relay when Accessibility is enabled"
             )
+            captureJob = scope.launch {
+                runDjiFlyUiSnapshotRelay(uiSnapshotSequenceAtStart)
+            }
         } else {
             captureJob = scope.launch {
                 if (config.sourceMode == TelemetrySourceMode.BenchWrappedSnapshots) {
@@ -178,6 +182,22 @@ class TelemetryCaptureService : Service() {
                     runCapture(config)
                 }
             }
+        }
+    }
+
+    private suspend fun runDjiFlyUiSnapshotRelay(startingSequence: Long) {
+        var lastSequence = startingSequence
+        while (currentCoroutineContext().isActive) {
+            DjiFlyUiSnapshotBus.latestAfter(lastSequence)?.let { snapshot ->
+                relay?.enqueue(
+                    DjiFlyUiSnapshotEvent(
+                        sessionId = sessionId,
+                        snapshot = snapshot
+                    )
+                )
+                lastSequence = snapshot.sequence
+            }
+            delay(UI_SNAPSHOT_RELAY_POLL_MS)
         }
     }
 
@@ -983,6 +1003,7 @@ class TelemetryCaptureService : Service() {
 
     @Synchronized
     private fun stopCapture(closeService: Boolean = true) {
+        DjiFlyUiSnapshotBus.endCapture()
         commandCancellation.cancel()
         commandJob?.cancel()
         commandJob = null
@@ -1072,6 +1093,7 @@ class TelemetryCaptureService : Service() {
         private const val SNAPSHOT_READ_BUFFER_BYTES = 32 * 1024
         private const val SNAPSHOT_MAX_RX_BYTES = 256 * 1024
         private const val MIN_COMMAND_INTERVAL_MS = 500L
+        private const val UI_SNAPSHOT_RELAY_POLL_MS = 250L
         private const val DEFAULT_RELAY_PORT = 8765
 
         private const val ACTION_START = "com.freefcc.app.telemetry.START"

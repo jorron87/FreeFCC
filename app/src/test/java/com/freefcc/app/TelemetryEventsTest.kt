@@ -169,6 +169,29 @@ class TelemetryEventsTest {
     }
 
     @Test
+    fun `DJI Fly UI snapshot preserves bounded labels without telemetry promotion`() {
+        val line = DjiFlyUiSnapshotEvent(
+            sessionId = "session-ui",
+            snapshot = DjiFlyUiSnapshot(
+                sequence = 3,
+                capturedAtUtc = "2026-07-25T20:00:00Z",
+                elapsedRealtimeNs = 4_000_000_000,
+                eventType = "TYPE_WINDOW_CONTENT_CHANGED",
+                labels = listOf("H 12.3 m", "Gimbal -90"),
+                visitedNodeCount = 42,
+                truncated = false
+            )
+        ).toJsonLine()
+
+        assertTrue(line.contains("\"type\":\"DJI_FLY_UI_SNAPSHOT\""))
+        assertTrue(line.contains("\"captured_at\":\"2026-07-25T20:00:00Z\""))
+        assertTrue(line.contains("\"labels\":[\"H 12.3 m\",\"Gimbal -90\"]"))
+        assertTrue(line.contains("\"quality\":\"ui_observation\""))
+        assertTrue(line.contains("\"semantics\":\"unparsed\""))
+        assertTrue(!line.contains("\"position\""))
+    }
+
+    @Test
     fun `telemetry tick preserves source freshness`() {
         val line = TelemetryTickEvent(
             sessionId = "session-2",

@@ -19,7 +19,8 @@ This is parallel metadata. Video muxing is outside the current release.
 ```text
 RC2 / FreeFCC research service
   -> one controller-local capture socket, or control-only DUML Lab
-  -> raw chunks + CRC-valid DUML over TCP NDJSON
+  -> bounded DJI Fly Accessibility UI snapshots in Lab mode
+  -> raw chunks + CRC-valid DUML + UI observations over TCP NDJSON
   -> Mac receiver and session artifacts
   -> one normalized GEOREFERENCE_SAMPLE per second
   -> optional MQTT output
@@ -39,7 +40,8 @@ The Mac receiver owns:
 
 ## Controller source policy
 
-`40007 1Hz` is the current bench source. It:
+`40007 1Hz` is a rejected flight source retained for explicit bench research.
+It:
 
 1. opens a new `127.0.0.1:40007` socket for each sample window;
 2. sends exactly one wrapped `02 -> 06`, `00/01` Version Inquiry;
@@ -48,9 +50,25 @@ The Mac receiver owns:
 5. paces the next bounded connection at one hertz;
 6. marks empty, malformed or failed snapshots unavailable before retrying.
 
-This is active bench behavior, not a flight-safe claim. The older periodic
-`03/44` primer and same-socket `00/01` keepalive are retired because a second
-write reset the tested RC2 socket.
+The source completed 20/20 bounded connections with repeated valid `03/43` and
+`04/05`, but DJI Fly's own telemetry disappeared on every one-second cycle.
+It must not be used while flying. The older periodic `03/44` primer and
+same-socket `00/01` keepalive are also retired because a second write reset the
+tested RC2 socket.
+
+The non-invasive runtime candidate is now `Lab only` plus DJI Fly UI snapshots.
+The Accessibility service polls only the active `dji.go.v5` window once per
+second, visits at most 300 nodes, and publishes at most 80 deduplicated labels
+and 1,500 characters. These events are `ui_observation` / `unparsed`: they do
+not populate the georeference envelope until a field parser has been correlated
+against controlled aircraft state. No DJI socket is opened by this path.
+
+Observed alternatives remain insufficient on this controller:
+
+- direct `40009` coexists with DJI Fly but lacks the required flight families;
+- passive controller-local `8902` is silent;
+- RC LAN `8902` accepts the socket but published zero bytes during a 90-second
+  DJI Fly handoff test.
 
 ## DUML Lab boundary
 
@@ -164,17 +182,20 @@ but does not publish MQTT.
 
 ## Remaining physical gate
 
-Install `1.5.3-research.11`, keep propellers off and DJI Fly in the foreground,
-then run `40007 1Hz` for at least ten minutes.
+Install `1.5.3-research.12`, enable the FreeFCC Accessibility service, select
+`Lab only`, start the relay, and keep DJI Fly in the foreground.
 
 Acceptance requires:
 
-1. zero DJI Fly reconnects, control-link warnings or pairing changes;
-2. one uninterrupted app session with one bounded connection per snapshot;
-3. repeated CRC-valid `03/43` and `04/05` frames;
-4. fresh one-second samples with nulls after deliberate source loss;
-5. heading and gimbal pitch following controlled movements;
-6. `03/57` treated as unknown unless a valid frame is captured and correlated;
+1. one UI snapshot per second without DJI Fly reconnects or telemetry loss;
+2. raw labels retained in NDJSON and the latest bounded set in session summary;
+3. controlled movement tests identifying position, height, heading and gimbal
+   labels, if DJI exposes them through Accessibility;
+4. parsed values remaining candidate until controlled correlation;
+5. missing or stale UI fields represented as unavailable, never replayed as
+   current metadata;
+6. a separate passive DUML source before any DUML-derived field is called
+   flight-safe;
 7. no MQTT backlog burst after broker or LAN interruption.
 
 The RC and drone do not need to be online for unit tests, replay, APK builds or

@@ -704,6 +704,46 @@ class SessionWriterTest(unittest.TestCase):
             self.assertEqual(1, summary["snapshot_failures"])
             self.assertEqual([], list((writer.session_dir / "raw").iterdir()))
 
+    def test_dji_fly_ui_snapshot_is_recorded_without_telemetry_promotion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = SessionWriter(Path(tmp))
+            writer.handle_event(
+                {
+                    "type": "HELLO",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "ui-snapshot",
+                    "source_mode": "duml_lab_control_only",
+                }
+            )
+            writer.handle_event(
+                {
+                    "type": "DJI_FLY_UI_SNAPSHOT",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "ui-snapshot",
+                    "source": "dji_fly_accessibility",
+                    "captured_at": "2026-07-25T20:00:00Z",
+                    "elapsed_realtime_ns": 5_000_000_000,
+                    "snapshot_seq": 7,
+                    "event_type": "TYPE_WINDOW_CONTENT_CHANGED",
+                    "labels": ["H 12.3 m", "Gimbal -90"],
+                    "node_count": 41,
+                    "truncated": False,
+                    "quality": "ui_observation",
+                    "semantics": "unparsed",
+                }
+            )
+
+            assert writer.session_dir is not None
+            summary = json.loads((writer.session_dir / "session-summary.json").read_text())
+            self.assertEqual(1, summary["dji_fly_ui_snapshots"])
+            self.assertEqual(
+                ["H 12.3 m", "Gimbal -90"],
+                summary["latest_dji_fly_ui"]["labels"],
+            )
+            self.assertIsNone(summary["georef"]["position"]["lat_deg"])
+            self.assertEqual("unknown", summary["georef"]["quality"]["position"])
+            self.assertEqual([], list((writer.session_dir / "raw").iterdir()))
+
     def test_gps_glns_candidate_decodes_hmsl_millimetres(self) -> None:
         payload = bytearray(34)
         struct.pack_into("<iii", payload, 0, 103_931_366, 591_011_495, 7_420)

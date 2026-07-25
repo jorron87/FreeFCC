@@ -132,6 +132,8 @@ class SessionStats:
     snapshot_attempts: int = 0
     snapshot_successes: int = 0
     snapshot_failures: int = 0
+    dji_fly_ui_snapshots: int = 0
+    latest_dji_fly_ui: dict[str, Any] = field(default_factory=dict)
     georeference_samples: int = 0
     parser_errors: int = 0
     capture_gaps: int = 0
@@ -418,6 +420,28 @@ class SessionWriter:
             )
             self.stats.snapshot_failures = int(
                 event.get("failure_count", self.stats.snapshot_failures) or 0
+            )
+        elif event_type == "DJI_FLY_UI_SNAPSHOT":
+            raw_labels = event.get("labels", [])
+            labels = (
+                [str(value)[:240] for value in raw_labels[:80]]
+                if isinstance(raw_labels, list)
+                else []
+            )
+            self.stats.dji_fly_ui_snapshots += 1
+            self.stats.latest_dji_fly_ui = {
+                "captured_at": event.get("captured_at"),
+                "elapsed_realtime_ns": event.get("elapsed_realtime_ns"),
+                "snapshot_seq": event.get("snapshot_seq"),
+                "event_type": event.get("event_type"),
+                "labels": labels,
+                "node_count": event.get("node_count"),
+                "truncated": bool(event.get("truncated", False)),
+                "quality": "ui_observation",
+                "semantics": "unparsed",
+            }
+            self.stats.latest_elapsed_realtime_ns = int(
+                event.get("elapsed_realtime_ns", self.stats.latest_elapsed_realtime_ns) or 0
             )
         elif event_type == "TELEMETRY_TICK":
             self.stats.latest_elapsed_realtime_ns = int(
@@ -709,6 +733,8 @@ class SessionWriter:
             "snapshot_attempts": self.stats.snapshot_attempts,
             "snapshot_successes": self.stats.snapshot_successes,
             "snapshot_failures": self.stats.snapshot_failures,
+            "dji_fly_ui_snapshots": self.stats.dji_fly_ui_snapshots,
+            "latest_dji_fly_ui": self.stats.latest_dji_fly_ui,
             "georeference_samples": self.stats.georeference_samples,
             "parser_errors": self.stats.parser_errors,
             "capture_gaps": self.stats.capture_gaps,
@@ -1116,6 +1142,7 @@ def replay_session(path: Path, out_root: Path) -> SessionWriter:
         "STREAM_RECORD_STATS",
         "STREAM_KEEPALIVE_STATS",
         "SNAPSHOT_STATS",
+        "DJI_FLY_UI_SNAPSHOT",
         "ERROR",
     }
     with path.open(encoding="utf-8") as handle:
@@ -1131,6 +1158,7 @@ def _print_status(stats: SessionStats) -> None:
         f"\rsource={stats.source_status} raw={stats.raw_chunks} "
         f"records={stats.stream_records} frames={stats.frames} snapshots="
         f"{stats.snapshot_successes}/{stats.snapshot_attempts} "
+        f"ui={stats.dji_fly_ui_snapshots} "
         f"samples={stats.georeference_samples} errors={stats.parser_errors} "
         f"bytes={stats.bytes}",
         end="",
