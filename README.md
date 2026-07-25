@@ -107,13 +107,18 @@ Back into your folder on the SD card. Install `03_ATVLauncher` but don't open it
 
 ### 5. Set up Edge Gestures
 
-Install `04_Edge Gestures` and this time tap OPEN. Follow the prompts and grant the Accessibility service permission. Then:
+Install `04_Edge Gestures` and this time tap OPEN. Follow the prompts and grant its Accessibility service permission. Then:
 
 - Disable the left gesture, keep only the right side
 - Scroll down to "Swipe to the left", tap it
 - Pick Application, then choose ATV Launcher
 
 Now swiping right-to-left on the screen opens the launcher.
+
+FreeFCC no longer depends on Edge Gestures to reach the hidden Accessibility
+panel. The Telemetry page shows whether `FreeFCC Home Point` is enabled and
+opens the same system panel directly. Starting `Lab` also opens it
+automatically when access is missing.
 
 ### 6. Install FreeFCC
 
@@ -180,7 +185,7 @@ Each command is a small binary packet with a magic byte (`0x55`), a header with 
 
 This fork adds a separate Telemetry tab for raw metadata research. It can stream `RAW_CHUNK` and validated `DUML_FRAME` NDJSON records to a local Mac on port `8765`.
 
-`1.5.3-research.12` defaults to the read-only RC2 publish endpoint
+`1.5.3-research.13` defaults to the read-only RC2 publish endpoint
 `127.0.0.1:8902`. One socket remains open for the explicit session, the app
 sends no bytes to that endpoint, and a `TELEMETRY_TICK` produces one Mac-side
 `GEOREFERENCE_SAMPLE` per second. A connected but silent endpoint is reported
@@ -313,8 +318,10 @@ rejected as a flight-safe source on this RC2/Neo 2 combination.
 Direct `40009` remained compatible with DJI Fly but exposed only a narrow RC
 stream without the required flight/gimbal families. Controller port `8902`
 accepted a LAN connection but stayed byte-silent in foreground, DJI Fly and
-handoff tests. `research.12` therefore keeps `Lab only` as the non-invasive
-runtime and adds the Accessibility UI snapshot stream for live label discovery.
+handoff tests. `research.12` therefore introduced `Lab only` as the
+non-invasive runtime and the Accessibility UI snapshot stream for live label
+discovery. `research.13` adds direct access to the RC2's otherwise hidden
+Accessibility panel.
 
 The Mac receiver now emits one field-freshness-controlled
 `GEOREFERENCE_SAMPLE` per second. AMSL from candidate `03/57` and takeoff
@@ -337,7 +344,7 @@ and periodic `07/19`/`07/30` country traffic does not improve metadata capture.
 The structured RM510 `51/14` layout is the relevant change adopted in this
 release.
 
-Current research build: `1.5.3-research.12`. It remains bench-only until its
+Current research build: `1.5.3-research.13`. It remains bench-only until its
 physical RC2 gate has passed. See
 [`docs/TELEMETRY_ARCHITECTURE.md`](docs/TELEMETRY_ARCHITECTURE.md) for the
 transport boundary and acceptance gates.

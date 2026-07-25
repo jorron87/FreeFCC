@@ -98,6 +98,11 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.refreshDjiFlyAccessibilityStatus()
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -329,7 +334,7 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
             Spacer(Modifier.height(8.dp))
             BodyText(
                 if (state.telemetryCapturePort == CONTROL_ONLY_PORT.toString()) {
-                    "CONTROL ONLY: relay stays alive while every DJI localhost port remains free for DUML Lab."
+                    "CONTROL ONLY: DJI ports stay free; visible DJI Fly labels relay through Accessibility."
                 } else if (state.telemetryStreamKeepaliveEnabled) {
                     "ACTIVE BENCH: one wrapped 00/01 per short-lived connection, paced at 1 Hz."
                 } else {
@@ -337,6 +342,20 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 },
                 if (state.telemetryStreamKeepaliveEnabled) Amber else TextDim
             )
+            Spacer(Modifier.height(14.dp))
+            InfoRow(
+                "DJI Fly UI access",
+                if (state.isDjiFlyAccessibilityEnabled) "ENABLED" else "REQUIRED",
+                if (state.isDjiFlyAccessibilityEnabled) Green else Amber
+            )
+            if (!state.isDjiFlyAccessibilityEnabled) {
+                Spacer(Modifier.height(12.dp))
+                GlowButton(
+                    "Open Accessibility",
+                    Amber,
+                    filled = false
+                ) { viewModel.openDjiFlyAccessibilitySettings() }
+            }
             Spacer(Modifier.height(18.dp))
             if (runtime.running) {
                 GlowButton("Stop Relay", Red) { viewModel.stopTelemetryRelay() }

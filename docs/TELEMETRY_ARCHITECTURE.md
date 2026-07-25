@@ -182,8 +182,10 @@ but does not publish MQTT.
 
 ## Remaining physical gate
 
-Install `1.5.3-research.12`, enable the FreeFCC Accessibility service, select
-`Lab only`, start the relay, and keep DJI Fly in the foreground.
+Install `1.5.3-research.13`, select `Lab only`, and start the relay. If
+`FreeFCC Home Point` is not enabled, the app opens the RC2's hidden
+Accessibility panel directly. Enable it, return to FreeFCC, then keep DJI Fly
+in the foreground.
 
 Acceptance requires:
 

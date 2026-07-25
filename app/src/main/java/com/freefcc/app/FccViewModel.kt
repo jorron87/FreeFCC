@@ -1,9 +1,11 @@
 package com.freefcc.app
 
 import android.app.Application
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.Bundle
 import android.provider.Settings
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -53,6 +55,7 @@ data class AppState(
     val updateEndpoint: String = UpdateChecker.DEFAULT_API_URL,
     // Keepalive state
     val isKeepaliveRunning: Boolean = false,
+    val isDjiFlyAccessibilityEnabled: Boolean = false,
     // Telemetry research state
     val telemetryHost: String = "",
     val telemetryPort: String = "8765",
@@ -82,7 +85,9 @@ data class AppState(
 class FccViewModel(private val app: Application) : AndroidViewModel(app) {
 
     companion object {
-        const val APP_VERSION = "1.5.3-research.12"
+        const val APP_VERSION = "1.5.3-research.13"
+        private const val SETTINGS_FRAGMENT_ARGS_KEY = ":settings:fragment_args_key"
+        private const val SETTINGS_SHOW_FRAGMENT_ARGS = ":settings:show_fragment_args"
 
         /**
          * Aircraft model codes known to support DJI Cellular Dongle 2 / 4G.
@@ -196,7 +201,16 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
         // correct after a process restart (e.g. low-memory kill + sticky restart).
         val keepaliveRunning = FccKeepaliveService.isRunningFlagSet(app) &&
             FccKeepaliveService.isDjiFlyTextAccessEnabled(app)
-        update { copy(controllerModel = model, status = "disconnected", autoFcc = autoEnabled, isKeepaliveRunning = keepaliveRunning) }
+        val accessibilityEnabled = FccKeepaliveService.isDjiFlyTextAccessEnabled(app)
+        update {
+            copy(
+                controllerModel = model,
+                status = "disconnected",
+                autoFcc = autoEnabled,
+                isKeepaliveRunning = keepaliveRunning,
+                isDjiFlyAccessibilityEnabled = accessibilityEnabled
+            )
+        }
 
         if (autoEnabled) {
             FccKeepaliveService.start(app)
@@ -215,6 +229,34 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     // --- Telemetry research ---
+
+    fun refreshDjiFlyAccessibilityStatus() {
+        val enabled = FccKeepaliveService.isDjiFlyTextAccessEnabled(app)
+        update { copy(isDjiFlyAccessibilityEnabled = enabled) }
+    }
+
+    fun openDjiFlyAccessibilitySettings() {
+        log("Opening Accessibility settings for FreeFCC Home Point")
+        runCatching {
+            val serviceComponent = ComponentName(
+                app,
+                DjiFlyAccessibilityService::class.java
+            ).flattenToString()
+            val fragmentArgs = Bundle().apply {
+                putString(SETTINGS_FRAGMENT_ARGS_KEY, serviceComponent)
+            }
+            app.startActivity(
+                Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    putExtra(SETTINGS_FRAGMENT_ARGS_KEY, serviceComponent)
+                    putExtra(SETTINGS_SHOW_FRAGMENT_ARGS, fragmentArgs)
+                }
+            )
+        }.onFailure { error ->
+            update { copy(message = "Could not open Accessibility settings: ${error.message}") }
+            log("Accessibility settings unavailable: ${error.message}")
+        }
+    }
 
     fun updateTelemetryHost(value: String) {
         prefs.edit().putString("telemetry_host", value.trim()).apply()
@@ -324,6 +366,12 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
         )
         TelemetryCaptureService.start(app, config)
         log("Telemetry relay starting: ${config.sourceMode.wireName} -> ${config.host}:${config.port}")
+        val accessibilityEnabled = FccKeepaliveService.isDjiFlyTextAccessEnabled(app)
+        update { copy(isDjiFlyAccessibilityEnabled = accessibilityEnabled) }
+        if (config.sourceMode == TelemetrySourceMode.DumlLabControlOnly && !accessibilityEnabled) {
+            log("Lab UI snapshots need FreeFCC Home Point Accessibility access")
+            openDjiFlyAccessibilitySettings()
+        }
     }
 
     fun stopTelemetryRelay() {
