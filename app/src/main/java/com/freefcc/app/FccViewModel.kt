@@ -85,7 +85,7 @@ data class AppState(
 class FccViewModel(private val app: Application) : AndroidViewModel(app) {
 
     companion object {
-        const val APP_VERSION = "1.5.3-research.14"
+        const val APP_VERSION = "1.5.3-research.15"
         private const val SETTINGS_FRAGMENT_ARGS_KEY = ":settings:fragment_args_key"
         private const val SETTINGS_SHOW_FRAGMENT_ARGS = ":settings:show_fragment_args"
 

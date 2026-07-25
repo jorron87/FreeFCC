@@ -10,6 +10,7 @@ internal class FlightLogTailer(
     sealed interface PollResult {
         data class Chunk(
             val logName: String,
+            val sourceDirectory: String,
             val offset: Long,
             val fileSize: Long,
             val newFile: Boolean,
@@ -57,7 +58,7 @@ internal class FlightLogTailer(
         }
         if (fileSize == offset) {
             return PollResult.Waiting(
-                "Following ${newest.name}; waiting for appended bytes at offset $offset"
+                "Following ${newest.name} from ${directory.path}; waiting for appended bytes at offset $offset"
             )
         }
 
@@ -76,6 +77,7 @@ internal class FlightLogTailer(
         offset += bytes.size
         return PollResult.Chunk(
             logName = newest.name,
+            sourceDirectory = directory.path,
             offset = startOffset,
             fileSize = fileSize,
             newFile = switched || startOffset == 0L,
@@ -87,6 +89,8 @@ internal class FlightLogTailer(
         private const val DEFAULT_CHUNK_BYTES = 32 * 1024
         private val FLIGHT_LOG_NAME = Regex("""^(DJI)?FlightRecord_.*\.txt$""")
         val DEFAULT_DIRECTORIES = listOf(
+            File("/storage/emulated/0/Download/product_data/flightRecords"),
+            File("/sdcard/Download/product_data/flightRecords"),
             File("/storage/emulated/0/Android/data/dji.go.v5/files/FlightRecord"),
             File("/sdcard/Android/data/dji.go.v5/files/FlightRecord")
         )

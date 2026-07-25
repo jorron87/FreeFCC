@@ -192,7 +192,7 @@ class TelemetryCaptureService : Service() {
         emitSourceStatus(
             config,
             sourceStatus,
-            "Reading DJI Fly FlightRecord directory; waiting for a growing log"
+            "Reading DJI Fly FlightRecord mirror; waiting for a growing log"
         )
         TelemetryStatusBus.update(
             TelemetryStatus(
@@ -217,7 +217,7 @@ class TelemetryCaptureService : Service() {
                         emitSourceStatus(
                             config,
                             sourceStatus,
-                            "Following ${result.logName} at offset ${result.offset}"
+                            "Following ${result.logName} from ${result.sourceDirectory} at offset ${result.offset}"
                         )
                     }
                     if (

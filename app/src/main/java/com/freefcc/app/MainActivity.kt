@@ -347,7 +347,7 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 if (state.telemetryCapturePort == CONTROL_ONLY_PORT.toString()) {
                     "CONTROL ONLY: DJI ports stay free; visible DJI Fly labels relay through Accessibility."
                 } else if (state.telemetryCapturePort == FLIGHT_LOG_SOURCE_PORT.toString()) {
-                    "READ ONLY: follows Android/data/dji.go.v5/files/FlightRecord without opening a DJI socket."
+                    "READ ONLY: follows DJI Fly's public Download flight-log mirror without opening a DJI socket."
                 } else if (state.telemetryStreamKeepaliveEnabled) {
                     "ACTIVE BENCH: one wrapped 00/01 per short-lived connection, paced at 1 Hz."
                 } else {

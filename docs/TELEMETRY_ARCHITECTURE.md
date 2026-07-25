@@ -182,7 +182,7 @@ but does not publish MQTT.
 
 ## Remaining physical gate
 
-Install `1.5.3-research.14`, grant the requested storage permission, select
+Install `1.5.3-research.15`, grant the requested storage permission, select
 `Log`, and start the relay. The source reads DJI Fly's growing
 `Android/data/dji.go.v5/files/FlightRecord/FlightRecord_*.txt` without opening
 a DUML socket. The Mac receiver reconstructs the log under the session's
