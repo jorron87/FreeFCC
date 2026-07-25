@@ -1,16 +1,16 @@
 package com.freefcc.app
 
 /**
- * Builds the wrapped General Version Inquiry used to keep a 40007 stream open.
+ * Builds the wrapped General Version Inquiry used to trigger one 40007 snapshot.
  *
  * This is the same app-to-RC route used by the independently tested RM330 LAN
  * reader: 02 -> 06, 00/01, no ACK requested. A fresh sequence and CRC are
- * generated for every write. The caller owns the one persistent socket and
- * must stop on EOF or write failure rather than reconnecting automatically.
+ * generated for every write. The RC2 broker accepts one command per connection,
+ * so callers must close after the bounded response window.
  *
  * Reference: stiad/dji-rc-linux@3acbcc33d2267f3247e36383a11958ed76ba7f96
  */
-internal class SameSocketTelemetryKeepalive(
+internal class WrappedSnapshotInquiry(
     private val builder: DumlBuilder = DumlBuilder()
 ) {
     fun next(): ByteArray = wrap(
@@ -40,26 +40,5 @@ internal class SameSocketTelemetryKeepalive(
             inner.copyInto(result, destinationOffset = 8)
             return result
         }
-    }
-}
-
-internal class StreamKeepaliveIdleGate(
-    private val idleTimeoutsBeforeSend: Int = 2
-) {
-    private var consecutiveTimeouts = 0
-
-    init {
-        require(idleTimeoutsBeforeSend > 0)
-    }
-
-    fun onBytesReceived() {
-        consecutiveTimeouts = 0
-    }
-
-    fun onReadTimeout(): Boolean {
-        consecutiveTimeouts += 1
-        if (consecutiveTimeouts < idleTimeoutsBeforeSend) return false
-        consecutiveTimeouts = 0
-        return true
     }
 }

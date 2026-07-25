@@ -5,14 +5,14 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class SameSocketTelemetryKeepaliveTest {
+class WrappedSnapshotInquiryTest {
     @Test
-    fun `each keepalive has a fresh sequence and valid wrapped version inquiry`() {
-        val keepalive = SameSocketTelemetryKeepalive()
+    fun `each snapshot inquiry has a fresh sequence and valid wrapped version inquiry`() {
+        val inquiry = WrappedSnapshotInquiry()
         val parser = WrappedDumlFrameParser()
 
-        val first = parser.feed(keepalive.next()).single()
-        val second = parser.feed(keepalive.next()).single()
+        val first = parser.feed(inquiry.next()).single()
+        val second = parser.feed(inquiry.next()).single()
 
         assertTrue(first is DumlFrameParser.Result.Frame)
         assertTrue(second is DumlFrameParser.Result.Frame)
@@ -25,16 +25,5 @@ class SameSocketTelemetryKeepaliveTest {
         assertEquals(0x00, first.frame.cmdSet)
         assertEquals(0x01, first.frame.cmdId)
         assertEquals("valid", first.frame.validationStatus)
-    }
-
-    @Test
-    fun `idle gate sends after two timeouts and resets on data`() {
-        val gate = StreamKeepaliveIdleGate(idleTimeoutsBeforeSend = 2)
-
-        assertTrue(!gate.onReadTimeout())
-        gate.onBytesReceived()
-        assertTrue(!gate.onReadTimeout())
-        assertTrue(gate.onReadTimeout())
-        assertTrue(!gate.onReadTimeout())
     }
 }

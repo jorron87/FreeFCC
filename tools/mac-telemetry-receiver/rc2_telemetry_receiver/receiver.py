@@ -129,6 +129,9 @@ class SessionStats:
     stream_records: int = 0
     stream_record_families: dict[str, int] = field(default_factory=dict)
     stream_keepalives: int = 0
+    snapshot_attempts: int = 0
+    snapshot_successes: int = 0
+    snapshot_failures: int = 0
     georeference_samples: int = 0
     parser_errors: int = 0
     capture_gaps: int = 0
@@ -374,10 +377,10 @@ class SessionWriter:
             self.stats.command_pairs[pair] = self.stats.command_pairs.get(pair, 0) + 1
         elif event_type == "ERROR":
             reason = str(event.get("reason", ""))
-            if reason == "capture_gap":
+            if reason in {"capture_gap", "snapshot_gap"}:
                 self.stats.capture_gaps += 1
                 self.stats.capture_state = "unavailable"
-                self.stats.last_error = f"capture_gap: {event.get('detail', '')}"
+                self.stats.last_error = f"{reason}: {event.get('detail', '')}"
                 self._clear_candidates(invalidate=True)
             else:
                 self.stats.parser_errors += 1
@@ -405,6 +408,16 @@ class SessionWriter:
         elif event_type == "STREAM_KEEPALIVE_STATS":
             self.stats.stream_keepalives = int(
                 event.get("sent_count", self.stats.stream_keepalives) or 0
+            )
+        elif event_type == "SNAPSHOT_STATS":
+            self.stats.snapshot_attempts = int(
+                event.get("attempt_count", self.stats.snapshot_attempts) or 0
+            )
+            self.stats.snapshot_successes = int(
+                event.get("success_count", self.stats.snapshot_successes) or 0
+            )
+            self.stats.snapshot_failures = int(
+                event.get("failure_count", self.stats.snapshot_failures) or 0
             )
         elif event_type == "TELEMETRY_TICK":
             self.stats.latest_elapsed_realtime_ns = int(
@@ -693,6 +706,9 @@ class SessionWriter:
             "stream_records": self.stats.stream_records,
             "stream_record_families": dict(sorted(self.stats.stream_record_families.items())),
             "stream_keepalives": self.stats.stream_keepalives,
+            "snapshot_attempts": self.stats.snapshot_attempts,
+            "snapshot_successes": self.stats.snapshot_successes,
+            "snapshot_failures": self.stats.snapshot_failures,
             "georeference_samples": self.stats.georeference_samples,
             "parser_errors": self.stats.parser_errors,
             "capture_gaps": self.stats.capture_gaps,
@@ -1099,6 +1115,7 @@ def replay_session(path: Path, out_root: Path) -> SessionWriter:
         "TELEMETRY_TICK",
         "STREAM_RECORD_STATS",
         "STREAM_KEEPALIVE_STATS",
+        "SNAPSHOT_STATS",
         "ERROR",
     }
     with path.open(encoding="utf-8") as handle:
@@ -1112,7 +1129,8 @@ def replay_session(path: Path, out_root: Path) -> SessionWriter:
 def _print_status(stats: SessionStats) -> None:
     print(
         f"\rsource={stats.source_status} raw={stats.raw_chunks} "
-        f"records={stats.stream_records} frames={stats.frames} keepalives={stats.stream_keepalives} "
+        f"records={stats.stream_records} frames={stats.frames} snapshots="
+        f"{stats.snapshot_successes}/{stats.snapshot_attempts} "
         f"samples={stats.georeference_samples} errors={stats.parser_errors} "
         f"bytes={stats.bytes}",
         end="",

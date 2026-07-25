@@ -1,6 +1,6 @@
 {
   "schema": "duml-lab/v1",
-  "name": "40007 wrapped version keepalive",
+  "name": "REGRESSION ONLY - 40007 same-socket repeated write",
   "port": 40007,
   "connect_timeout_ms": 2000,
   "total_timeout_ms": 10000,
@@ -39,7 +39,7 @@
     },
     {
       "op": "write_duml",
-      "label": "fresh version keepalive",
+      "label": "known reset-triggering second write",
       "sender": 2,
       "destination": 6,
       "cmd_type": 0,

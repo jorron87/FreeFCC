@@ -180,7 +180,7 @@ Each command is a small binary packet with a magic byte (`0x55`), a header with 
 
 This fork adds a separate Telemetry tab for raw metadata research. It can stream `RAW_CHUNK` and validated `DUML_FRAME` NDJSON records to a local Mac on port `8765`.
 
-`1.5.3-research.10` defaults to the read-only RC2 publish endpoint
+`1.5.3-research.11` defaults to the read-only RC2 publish endpoint
 `127.0.0.1:8902`. One socket remains open for the explicit session, the app
 sends no bytes to that endpoint, and a `TELEMETRY_TICK` produces one Mac-side
 `GEOREFERENCE_SAMPLE` per second. A connected but silent endpoint is reported
@@ -195,12 +195,15 @@ explicit bench connection.
 Port `8902` uses a bounded parser for `F5 64`, `F6 64`, and `F8 64`
 length-delimited records and their 32-bit controller clock. It is not DUML.
 Raw bytes are retained as chunk artifacts and `raw-stream.bin` for replay.
-Port `40007` must never be reopened periodically. The active keepalive source
-uses only its one existing socket and stops terminally on EOF or write failure.
+The active `40007 1Hz` source follows the controller's observed one-command-
+per-connection contract. Every second it opens a bounded socket, sends one
+wrapped `02 -> 06`, `00/01` inquiry, captures the response burst, and closes.
+It never writes a second command on the same socket. A snapshot is fresh only
+when it contains CRC-valid DUML without parser errors; any failed round emits
+`unavailable` before the next bounded attempt.
 
-Each source start opens exactly one connection. Passive sources write no source
-bytes; `40007 Keepalive` is explicitly active. EOF or I/O failure records a
-capture gap, clears live metadata, and requires explicit restart.
+Passive sources still write no source bytes and hold one explicit connection.
+EOF or I/O failure records a capture gap and clears live metadata.
 The ongoing Android telemetry notification remains active after switching to
 DJI Fly and reports `active`, `open_silent`, gap, or unavailable.
 
@@ -274,7 +277,7 @@ Run or edit a bounded lab strategy without rebuilding Android:
 
 ```sh
 python -m rc2_telemetry_receiver \
-  --lab recipes/40007-version-keepalive.json
+  --lab recipes/40007-reconnect-snapshots.json
 ```
 
 Starter recipes also cover a single direct `40009` transaction and a passive
@@ -287,14 +290,14 @@ Home Point Accessibility service waits on localized DJI Fly text without
 opening DUML, then sends the complete FCC profile once on a short `40009`
 lease. Manual FCC and the general one-shot DUML Lab remain available.
 
-The physical `research.9` session disproved its `03/44` primer strategy on the
-tested Neo 2: the second write reset the socket. `research.10` replaces it with
-the idle-triggered wrapped General Version Inquiry used by
-`stiad/dji-rc-linux`: `02 -> 06`, `00/01`, no ACK requested, fresh sequence and
-CRC on the same socket. A direct RC2 LAN check kept `40007` open for 3.011
-seconds, received 4,116 bytes and 92 CRC-valid frames while sending 40
-keepalives. The short check did not include `03/43` or `04/05`, so sustained
-georeference delivery and zero DJI Fly link warnings remain physical gates.
+The 2026-07-25 physical session disproved socket reuse on the tested Neo 2.
+One `00/01` inquiry produced a valid response burst, but the controller closed
+the idle socket after roughly two seconds and a rapid second write reset it.
+The one-command-per-connection Lab recipe then completed three one-hertz
+snapshots while DJI Fly was open: three connections, 63 TX bytes, 6,026 RX
+bytes, CRC-valid frames in every window, and no parser error or reset.
+`research.11` implements that exact transport contract. Sustained delivery and
+zero DJI Fly link warnings over a longer run remain physical gates.
 
 The Mac receiver now emits one field-freshness-controlled
 `GEOREFERENCE_SAMPLE` per second. AMSL from candidate `03/57` and takeoff
@@ -317,7 +320,7 @@ and periodic `07/19`/`07/30` country traffic does not improve metadata capture.
 The structured RM510 `51/14` layout is the relevant change adopted in this
 release.
 
-Current research build: `1.5.3-research.10`. It remains bench-only until its
+Current research build: `1.5.3-research.11`. It remains bench-only until its
 physical RC2 gate has passed. See
 [`docs/TELEMETRY_ARCHITECTURE.md`](docs/TELEMETRY_ARCHITECTURE.md) for the
 transport boundary and acceptance gates.

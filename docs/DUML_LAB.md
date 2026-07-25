@@ -14,7 +14,7 @@ socket strategies from the Mac without publishing another APK.
 ```sh
 cd tools/mac-telemetry-receiver
 python -m rc2_telemetry_receiver \
-  --lab recipes/40007-version-keepalive.json
+  --lab recipes/40007-reconnect-snapshots.json
 ```
 
 The control listener remains on `127.0.0.1:8766`. It cannot be exposed on LAN.
@@ -60,6 +60,11 @@ The control listener remains on `127.0.0.1:8766`. It cannot be exposed on LAN.
 `setup` and `teardown` execute once. `cycle` executes `cycle_count` times while
 preserving socket state. Put `close` and `connect` inside the cycle to test
 one-connection-per-cycle behavior.
+
+For the tested RC2 `40007` broker this is the required production-research
+shape: one wrapped command, one bounded read window, then close. See
+`recipes/40007-reconnect-snapshots.json`. Reusing a connection for another
+write is retained only as a regression experiment because it reset the socket.
 
 ## Operations
 

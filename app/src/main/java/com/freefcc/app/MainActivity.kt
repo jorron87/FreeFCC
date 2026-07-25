@@ -206,9 +206,14 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         when {
-                            runtime.running && runtime.relayConnected && runtime.captureActive -> "Streaming to Mac"
+                            runtime.running && runtime.relayConnected &&
+                                runtime.sourceStatus == "active" -> "Streaming fresh metadata"
                             runtime.running && runtime.relayConnected &&
                                 runtime.sourceMode == "duml_lab_control_only" -> "DUML Lab ready"
+                            runtime.running && runtime.relayConnected &&
+                                runtime.sourceStatus == "unavailable" -> "Relay connected; metadata unavailable"
+                            runtime.running && runtime.relayConnected &&
+                                runtime.captureActive -> "Relay connected; source waiting"
                             runtime.running && runtime.relayConnected -> "Relay connected; capture stopped"
                             runtime.running || runtime.connecting -> "Starting relay"
                             runtime.lastError.isNotEmpty() -> "Stopped fail-closed"
@@ -232,8 +237,10 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
             BodyText(
                 if (runtime.sourceMode == "duml_lab_control_only") {
                     "Mac-controlled bounded DUML recipes; no controller capture port is held."
+                } else if (runtime.sourceMode == "bench_wrapped_snapshot_1hz") {
+                    "One wrapped 00/01 command per short-lived 40007 connection, paced at 1 Hz."
                 } else {
-                    "One explicit source connection. Keepalive 40007 sends an idle-based 00/01 version inquiry on the same socket; EOF and write failures stop without reconnect."
+                    "One explicit passive source connection; source gaps make metadata unavailable."
                 },
                 Amber
             )
@@ -247,9 +254,17 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 BodyText(runtime.lastError, Red)
             }
             Spacer(Modifier.height(12.dp))
-            InfoRow("Source", runtime.sourceStatus.uppercase(), if (runtime.sourceStatus == "active") Green else Amber)
+            InfoRow(
+                "Source",
+                runtime.sourceStatus.uppercase(),
+                when (runtime.sourceStatus) {
+                    "active" -> Green
+                    "unavailable" -> Red
+                    else -> Amber
+                }
+            )
             Spacer(Modifier.height(8.dp))
-            InfoRow("Keepalives", runtime.keepalives.toString(), TextWhite)
+            InfoRow("Snapshots", runtime.snapshots.toString(), TextWhite)
             Spacer(Modifier.height(8.dp))
             InfoRow("Records", runtime.records.toString(), TextWhite)
         }
@@ -289,7 +304,7 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 listOf(
                     Triple("Lab", CONTROL_ONLY_PORT, false),
                     Triple("8902", 8902, false),
-                    Triple("40007 KA", 40007, true),
+                    Triple("40007 1Hz", 40007, true),
                     Triple("40007 Snap", 40007, false)
                 ).forEachIndexed { index, choice ->
                     SegmentedButton(
@@ -316,7 +331,7 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 if (state.telemetryCapturePort == CONTROL_ONLY_PORT.toString()) {
                     "CONTROL ONLY: relay stays alive while every DJI localhost port remains free for DUML Lab."
                 } else if (state.telemetryStreamKeepaliveEnabled) {
-                    "ACTIVE BENCH: idle-based 00/01 keepalive, same socket, no reconnect."
+                    "ACTIVE BENCH: one wrapped 00/01 per short-lived connection, paced at 1 Hz."
                 } else {
                     "Passive source; no writes or automatic reconnect."
                 },
@@ -734,8 +749,8 @@ private fun InfoPage(state: AppState, viewModel: FccViewModel) {
             DividerLine()
             Spacer(Modifier.height(10.dp))
             InfoRow(
-                "Status",
-                if (state.isConnected) "Connected" else "Disconnected",
+                "DUML check",
+                if (state.isConnected) "Ready" else "Not checked",
                 valueColor = if (state.isConnected) Green else TextGray
             )
             Spacer(Modifier.height(10.dp))
@@ -1298,23 +1313,27 @@ private fun PageTitle(title: String, icon: androidx.compose.ui.graphics.vector.I
 @Composable
 private fun ConnectionPill(state: AppState) {
     val (label, color) = when {
-        state.status == "connecting" -> "Connecting..." to Amber
-        state.isConnected -> "Connected" to Green
+        state.status == "connecting" -> "Checking DUML..." to Amber
+        state.isConnected -> "DUML ready" to Green
+        state.telemetryRuntime.running && state.telemetryRuntime.relayConnected ->
+            "Relay active" to Cyan
         state.status == "error" -> "Error" to Red
-        else -> "Disconnected" to TextGray
+        else -> "DUML not checked" to TextGray
     }
 
     // Bounce-in on state change (no scale overflow — use alpha + small bump)
     val bounce = remember { Animatable(1f) }
-    LaunchedEffect(state.isConnected) {
-        if (state.isConnected) {
+    val active = state.isConnected ||
+        (state.telemetryRuntime.running && state.telemetryRuntime.relayConnected)
+    LaunchedEffect(active) {
+        if (active) {
             bounce.snapTo(0.8f)
             bounce.animateTo(1f, spring(dampingRatio = Spring.DampingRatioMediumBouncy))
         }
     }
 
     // Pulsing glow when connected
-    val glowAlpha: Float = if (state.isConnected) {
+    val glowAlpha: Float = if (active) {
         val t = rememberInfiniteTransition(label = "pill")
         val a by t.animateFloat(0.1f, 0.25f, infiniteRepeatable(tween(1800), RepeatMode.Reverse), label = "pillGlow")
         a

@@ -17,6 +17,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.IOException
@@ -51,8 +52,9 @@ class TelemetryCaptureService : Service() {
     private var sourceStatus = "stopped"
     private var lastByteElapsedNs = 0L
     private var lastTickElapsedNs = 0L
-    private var streamKeepaliveCount = 0L
-    private var lastKeepaliveStatsElapsedNs = 0L
+    private var snapshotAttemptCount = 0L
+    private var snapshotSuccessCount = 0L
+    private var snapshotFailureCount = 0L
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -115,8 +117,9 @@ class TelemetryCaptureService : Service() {
         sourceStatus = "connecting"
         lastByteElapsedNs = 0L
         lastTickElapsedNs = 0L
-        streamKeepaliveCount = 0L
-        lastKeepaliveStatsElapsedNs = 0L
+        snapshotAttemptCount = 0L
+        snapshotSuccessCount = 0L
+        snapshotFailureCount = 0L
 
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification("Relay starting"))
@@ -132,7 +135,7 @@ class TelemetryCaptureService : Service() {
                 captureActive = false,
                 rawChunks = 0,
                 frames = 0,
-                keepalives = 0,
+                snapshots = 0,
                 parserErrors = 0,
                 bytes = 0,
                 queueDepth = 0,
@@ -169,7 +172,11 @@ class TelemetryCaptureService : Service() {
             )
         } else {
             captureJob = scope.launch {
-                runCapture(config)
+                if (config.sourceMode == TelemetrySourceMode.BenchWrappedSnapshots) {
+                    runWrappedSnapshotCapture(config)
+                } else {
+                    runCapture(config)
+                }
             }
         }
     }
@@ -396,6 +403,269 @@ class TelemetryCaptureService : Service() {
         }
     }
 
+    private suspend fun runWrappedSnapshotCapture(config: TelemetryConfig) {
+        val sourcePort = config.capturePort
+        val lease = DumlPortSessionLock.tryBegin(sourcePort)
+        if (lease == null) {
+            reportCaptureGap(config, "Controller port $sourcePort is already in use")
+            return
+        }
+
+        val inquiry = WrappedSnapshotInquiry()
+        sourceStatus = "snapshot_waiting"
+        emitSourceStatus(
+            config,
+            sourceStatus,
+            "One wrapped 00/01 command per short-lived connection at 1 Hz"
+        )
+        TelemetryStatusBus.update(
+            TelemetryStatus(
+                connecting = false,
+                captureActive = true,
+                sourcePort = sourcePort,
+                sourceStatus = sourceStatus,
+                lastError = ""
+            )
+        )
+
+        try {
+            while (currentCoroutineContext().isActive) {
+                val cycleStartedNs = SystemClock.elapsedRealtimeNanos()
+                val parser = WrappedDumlFrameParser()
+                val framesBefore = frameCount
+                val errorsBefore = parserErrors
+                var socket: Socket? = null
+                var receivedBytes = 0
+                var failureReason: String? = null
+                snapshotAttemptCount += 1
+
+                try {
+                    socket = Socket()
+                    captureSocket = socket
+                    socket.connect(InetSocketAddress(DUML_HOST, sourcePort), DUML_CONNECT_TIMEOUT_MS)
+                    socket.tcpNoDelay = true
+
+                    val request = inquiry.next()
+                    socket.getOutputStream().apply {
+                        write(request)
+                        flush()
+                    }
+                    recordRawChunk(
+                        config = config,
+                        direction = "client_to_controller",
+                        bytes = request,
+                        elapsedNs = SystemClock.elapsedRealtimeNanos()
+                    )
+
+                    val input = socket.getInputStream()
+                    val readDeadlineNs =
+                        SystemClock.elapsedRealtimeNanos() + SNAPSHOT_READ_WINDOW_MS * 1_000_000L
+                    while (currentCoroutineContext().isActive) {
+                        val remainingNs = readDeadlineNs - SystemClock.elapsedRealtimeNanos()
+                        if (remainingNs <= 0L) break
+                        socket.soTimeout = minOf(
+                            SNAPSHOT_IDLE_TIMEOUT_MS,
+                            ((remainingNs + 999_999L) / 1_000_000L).coerceAtLeast(1L).toInt()
+                        )
+                        val buffer = ByteArray(SNAPSHOT_READ_BUFFER_BYTES)
+                        val n = try {
+                            input.read(buffer)
+                        } catch (_: java.net.SocketTimeoutException) {
+                            break
+                        }
+                        if (n <= 0) break
+                        receivedBytes += n
+                        if (receivedBytes > SNAPSHOT_MAX_RX_BYTES) {
+                            failureReason = "Snapshot exceeded $SNAPSHOT_MAX_RX_BYTES receive bytes"
+                            break
+                        }
+                        recordInboundDumlChunk(
+                            config = config,
+                            parser = parser,
+                            bytes = buffer.copyOf(n),
+                            elapsedNs = SystemClock.elapsedRealtimeNanos()
+                        )
+                    }
+                } catch (e: IOException) {
+                    if (currentCoroutineContext().isActive) {
+                        failureReason = "Snapshot socket failed: ${e.message.orEmpty()}"
+                    }
+                } finally {
+                    try { socket?.close() } catch (_: Exception) {}
+                    if (captureSocket === socket) captureSocket = null
+                }
+
+                if (!currentCoroutineContext().isActive) return
+                recordDumlResults(config, rawSeq, SystemClock.elapsedRealtimeNanos(), parser.finish())
+
+                val snapshotFrames = (frameCount - framesBefore).toInt()
+                val snapshotErrors = parserErrors - errorsBefore
+                failureReason = WrappedSnapshotPolicy.failureReason(
+                    transportFailure = failureReason,
+                    receivedBytes = receivedBytes,
+                    frameCount = snapshotFrames,
+                    parserErrorCount = snapshotErrors
+                )
+
+                if (failureReason == null) {
+                    snapshotSuccessCount += 1
+                    if (sourceStatus != "active") {
+                        sourceStatus = "active"
+                        emitSourceStatus(
+                            config,
+                            sourceStatus,
+                            "Receiving CRC-valid one-command snapshots"
+                        )
+                    }
+                    TelemetryStatusBus.update(
+                        TelemetryStatus(
+                            running = true,
+                            connecting = false,
+                            captureActive = true,
+                            sourceStatus = sourceStatus,
+                            rawChunks = rawChunks,
+                            frames = frameCount,
+                            snapshots = snapshotAttemptCount,
+                            parserErrors = parserErrors,
+                            bytes = byteCount,
+                            lastError = ""
+                        )
+                    )
+                } else {
+                    snapshotFailureCount += 1
+                    sourceStatus = "unavailable"
+                    emitSourceStatus(config, sourceStatus, failureReason)
+                    relay?.enqueue(
+                        TelemetryErrorEvent(
+                            sessionId = sessionId,
+                            reason = "snapshot_gap",
+                            detail = failureReason
+                        )
+                    )
+                    relay?.enqueue(
+                        TelemetryUnavailableEvent(
+                            sessionId = sessionId,
+                            sourceId = config.sourceId,
+                            reason = failureReason
+                        )
+                    )
+                    TelemetryStatusBus.update(
+                        TelemetryStatus(
+                            running = true,
+                            connecting = false,
+                            captureActive = true,
+                            sourceStatus = sourceStatus,
+                            rawChunks = rawChunks,
+                            frames = frameCount,
+                            snapshots = snapshotAttemptCount,
+                            parserErrors = parserErrors,
+                            bytes = byteCount,
+                            lastError = "$failureReason; retrying with a new bounded snapshot"
+                        )
+                    )
+                }
+
+                val nowNs = SystemClock.elapsedRealtimeNanos()
+                relay?.enqueue(
+                    SnapshotStatsEvent(
+                        sessionId = sessionId,
+                        elapsedRealtimeNs = nowNs,
+                        source = config.sourceMode.wireName,
+                        port = sourcePort,
+                        attemptCount = snapshotAttemptCount,
+                        successCount = snapshotSuccessCount,
+                        failureCount = snapshotFailureCount,
+                        rxBytes = receivedBytes,
+                        frameCount = snapshotFrames,
+                        intervalMs = config.sampleIntervalMs
+                    )
+                )
+                emitTick(config, nowNs)
+
+                val cycleElapsedMs = (SystemClock.elapsedRealtimeNanos() - cycleStartedNs) / 1_000_000L
+                val delayMs = WrappedSnapshotPolicy.remainingDelayMs(
+                    config.sampleIntervalMs,
+                    cycleElapsedMs
+                )
+                if (delayMs > 0L) delay(delayMs)
+            }
+        } finally {
+            lease.close()
+        }
+    }
+
+    private fun recordRawChunk(
+        config: TelemetryConfig,
+        direction: String,
+        bytes: ByteArray,
+        elapsedNs: Long
+    ): Long {
+        val seq = ++rawSeq
+        rawChunks += 1
+        byteCount += bytes.size
+        if (config.rawRelayEnabled) {
+            relay?.enqueue(
+                RawChunkEvent(
+                    sessionId = sessionId,
+                    seq = seq,
+                    elapsedRealtimeNs = elapsedNs,
+                    source = config.sourceMode.wireName,
+                    direction = direction,
+                    port = config.capturePort,
+                    bytes = bytes
+                )
+            )
+        }
+        return seq
+    }
+
+    private fun recordInboundDumlChunk(
+        config: TelemetryConfig,
+        parser: WrappedDumlFrameParser,
+        bytes: ByteArray,
+        elapsedNs: Long
+    ) {
+        val seq = recordRawChunk(config, "controller_to_client", bytes, elapsedNs)
+        lastByteElapsedNs = elapsedNs
+        recordDumlResults(config, seq, elapsedNs, parser.feed(bytes))
+    }
+
+    private fun recordDumlResults(
+        config: TelemetryConfig,
+        rawChunkSeq: Long,
+        elapsedNs: Long,
+        results: List<DumlFrameParser.Result>
+    ) {
+        for (result in results) {
+            when (result) {
+                is DumlFrameParser.Result.Frame -> {
+                    frameCount += 1
+                    relay?.enqueue(
+                        DumlFrameEvent(
+                            sessionId = sessionId,
+                            rawSeq = rawChunkSeq,
+                            elapsedRealtimeNs = elapsedNs,
+                            frame = result.frame,
+                            source = config.sourceMode.wireName,
+                            direction = "controller_to_client",
+                            port = config.capturePort
+                        )
+                    )
+                }
+                is DumlFrameParser.Result.Error -> {
+                    parserErrors += 1
+                    relay?.enqueue(
+                        TelemetryErrorEvent(
+                            sessionId = sessionId,
+                            reason = result.error.reason,
+                            detail = result.error.detail
+                        )
+                    )
+                }
+            }
+        }
+    }
+
     private suspend fun runCapture(config: TelemetryConfig) {
         val isPublishStream = config.sourceMode == TelemetrySourceMode.Rc2PublishStream
         val buffer = ByteArray(if (isPublishStream) 32 * 1024 else 4 * 1024)
@@ -413,39 +683,9 @@ class TelemetryCaptureService : Service() {
         try {
             socket.connect(InetSocketAddress(DUML_HOST, sourcePort), DUML_CONNECT_TIMEOUT_MS)
             socket.tcpNoDelay = true
-            socket.soTimeout = if (config.streamKeepaliveEnabled) {
-                STREAM_KEEPALIVE_READ_TIMEOUT_MS
-            } else {
-                SOURCE_READ_TIMEOUT_MS
-            }
-            val streamKeepalive = if (config.streamKeepaliveEnabled) {
-                SameSocketTelemetryKeepalive()
-            } else {
-                null
-            }
-            val keepaliveIdleGate = if (streamKeepalive != null) {
-                StreamKeepaliveIdleGate(STREAM_KEEPALIVE_IDLE_TIMEOUTS)
-            } else {
-                null
-            }
-            val output = if (streamKeepalive != null) socket.getOutputStream() else null
-            if (streamKeepalive != null && output != null) {
-                sendStreamKeepalive(
-                    config,
-                    streamKeepalive,
-                    output,
-                    SystemClock.elapsedRealtimeNanos()
-                )
-                sourceStatus = "keepalive_waiting"
-                emitSourceStatus(
-                    config,
-                    sourceStatus,
-                    "Connected; idle-based 00/01 keepalive active on the same socket"
-                )
-            } else {
-                sourceStatus = "open_waiting"
-                emitSourceStatus(config, "open_waiting", "Connected read-only; waiting for source bytes")
-            }
+            socket.soTimeout = SOURCE_READ_TIMEOUT_MS
+            sourceStatus = "open_waiting"
+            emitSourceStatus(config, "open_waiting", "Connected read-only; waiting for source bytes")
             TelemetryStatusBus.update(
                 TelemetryStatus(
                     connecting = false,
@@ -462,19 +702,11 @@ class TelemetryCaptureService : Service() {
                 val n = try {
                     input.read(buffer)
                 } catch (_: java.net.SocketTimeoutException) {
-                    if (
-                        streamKeepalive != null &&
-                        keepaliveIdleGate?.onReadTimeout() == true &&
-                        output != null
-                    ) {
-                        sendStreamKeepalive(config, streamKeepalive, output, beforeReadNs)
-                    }
                     updateSourceSilence(config, beforeReadNs)
                     emitTickIfDue(config, beforeReadNs)
                     continue
                 }
                 if (n <= 0) break
-                keepaliveIdleGate?.onBytesReceived()
                 val capturedElapsedNs = SystemClock.elapsedRealtimeNanos()
                 lastByteElapsedNs = capturedElapsedNs
                 if (sourceStatus != "active") {
@@ -563,7 +795,7 @@ class TelemetryCaptureService : Service() {
                         sourceStatus = sourceStatus,
                         rawChunks = rawChunks,
                         frames = frameCount,
-                        keepalives = streamKeepaliveCount,
+                        snapshots = snapshotAttemptCount,
                         records = recordCount,
                         parserErrors = parserErrors,
                         bytes = byteCount
@@ -643,53 +875,13 @@ class TelemetryCaptureService : Service() {
         )
     }
 
-    private fun sendStreamKeepalive(
-        config: TelemetryConfig,
-        keepalive: SameSocketTelemetryKeepalive,
-        output: java.io.OutputStream,
-        elapsedNs: Long
-    ) {
-        val bytes = keepalive.next()
-        output.write(bytes)
-        output.flush()
-        streamKeepaliveCount += 1
-        if (
-            lastKeepaliveStatsElapsedNs == 0L ||
-            elapsedNs - lastKeepaliveStatsElapsedNs >= KEEPALIVE_STATS_INTERVAL_NS
-        ) {
-            lastKeepaliveStatsElapsedNs = elapsedNs
-            TelemetryStatusBus.update(TelemetryStatus(keepalives = streamKeepaliveCount))
-            relay?.enqueue(
-                StreamKeepaliveStatsEvent(
-                    sessionId = sessionId,
-                    elapsedRealtimeNs = elapsedNs,
-                    source = config.sourceMode.wireName,
-                    port = config.capturePort,
-                    sentCount = streamKeepaliveCount,
-                    readTimeoutMs = STREAM_KEEPALIVE_READ_TIMEOUT_MS,
-                    idleTimeoutsBeforeSend = STREAM_KEEPALIVE_IDLE_TIMEOUTS
-                )
-            )
-        }
-        if (streamKeepaliveCount == 1L) {
-            val seq = ++rawSeq
-            relay?.enqueue(
-                RawChunkEvent(
-                    sessionId = sessionId,
-                    seq = seq,
-                    elapsedRealtimeNs = elapsedNs,
-                    source = config.sourceMode.wireName,
-                    direction = "client_to_controller",
-                    port = config.capturePort,
-                    bytes = bytes
-                )
-            )
-        }
-    }
-
     private fun emitTickIfDue(config: TelemetryConfig, nowNs: Long) {
         val intervalNs = config.sampleIntervalMs * 1_000_000L
         if (lastTickElapsedNs != 0L && nowNs - lastTickElapsedNs < intervalNs) return
+        emitTick(config, nowNs)
+    }
+
+    private fun emitTick(config: TelemetryConfig, nowNs: Long) {
         lastTickElapsedNs = nowNs
         val ageMs = lastByteAgeMs(nowNs)
         relay?.enqueue(
@@ -875,9 +1067,10 @@ class TelemetryCaptureService : Service() {
         private const val DUML_CONNECT_TIMEOUT_MS = 2_000
         private const val SOURCE_READ_TIMEOUT_MS = 250
         private const val SOURCE_GAP_AFTER_MS = 2_000L
-        private const val STREAM_KEEPALIVE_READ_TIMEOUT_MS = 20
-        private const val STREAM_KEEPALIVE_IDLE_TIMEOUTS = 2
-        private const val KEEPALIVE_STATS_INTERVAL_NS = 1_000_000_000L
+        private const val SNAPSHOT_READ_WINDOW_MS = 500L
+        private const val SNAPSHOT_IDLE_TIMEOUT_MS = 100
+        private const val SNAPSHOT_READ_BUFFER_BYTES = 32 * 1024
+        private const val SNAPSHOT_MAX_RX_BYTES = 256 * 1024
         private const val MIN_COMMAND_INTERVAL_MS = 500L
         private const val DEFAULT_RELAY_PORT = 8765
 

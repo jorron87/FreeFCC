@@ -321,10 +321,17 @@ class SessionWriterTest(unittest.TestCase):
                     detail="socket closed; reconnecting",
                 )
             )
+            writer.handle_event(
+                error_event(
+                    session_id="gap-session",
+                    reason="snapshot_gap",
+                    detail="snapshot returned no source bytes",
+                )
+            )
 
             assert writer.session_dir is not None
             summary = json.loads((writer.session_dir / "session-summary.json").read_text())
-            self.assertEqual(1, summary["capture_gaps"])
+            self.assertEqual(2, summary["capture_gaps"])
             self.assertEqual(0, summary["parser_errors"])
             self.assertEqual("unavailable", summary["capture_state"])
             self.assertEqual("unavailable", summary["georef"]["quality"]["position"])
@@ -665,6 +672,36 @@ class SessionWriterTest(unittest.TestCase):
             assert writer.session_dir is not None
             summary = json.loads((writer.session_dir / "session-summary.json").read_text())
             self.assertEqual(42, summary["stream_keepalives"])
+            self.assertEqual([], list((writer.session_dir / "raw").iterdir()))
+
+    def test_snapshot_stats_are_recorded_without_raw_artifact_expansion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = SessionWriter(Path(tmp))
+            writer.handle_event(
+                {
+                    "type": "HELLO",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "snapshot-stats",
+                    "source_mode": "bench_wrapped_snapshot_1hz",
+                }
+            )
+            writer.handle_event(
+                {
+                    "type": "SNAPSHOT_STATS",
+                    "session_id": "snapshot-stats",
+                    "attempt_count": 3,
+                    "success_count": 2,
+                    "failure_count": 1,
+                    "last_rx_bytes": 4116,
+                    "last_frame_count": 92,
+                }
+            )
+
+            assert writer.session_dir is not None
+            summary = json.loads((writer.session_dir / "session-summary.json").read_text())
+            self.assertEqual(3, summary["snapshot_attempts"])
+            self.assertEqual(2, summary["snapshot_successes"])
+            self.assertEqual(1, summary["snapshot_failures"])
             self.assertEqual([], list((writer.session_dir / "raw").iterdir()))
 
     def test_gps_glns_candidate_decodes_hmsl_millimetres(self) -> None:

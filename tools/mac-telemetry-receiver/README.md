@@ -14,9 +14,10 @@ Non-loopback control binds are rejected because this interface can transmit
 arbitrary research bytes to controller-local ports.
 On the tested Neo 2 firmware, `8902 Passive` accepted a socket but remained
 silent. `40007 Snapshot` returned useful wrapped DUML for about two seconds.
-`40007 Keepalive` is the current active bench source: it opens one socket and
-sends an idle-triggered wrapped `02 -> 06`, `00/01` Version Inquiry on that
-same socket. It never reconnects automatically after EOF or write failure.
+`40007 1Hz` is the current active bench source: once per second it opens a new
+socket, sends one wrapped `02 -> 06`, `00/01` Version Inquiry, reads a bounded
+response burst, and closes. Reusing one socket for a second command reset the
+tested controller, so the app never sends more than one command per connection.
 
 The receiver stores chunks plus `raw-stream.bin`, validates wrapped DUML, and
 writes one `GEOREFERENCE_SAMPLE` for every one-second Android tick. Each sample
@@ -38,7 +39,7 @@ port. Then run a recipe:
 
 ```sh
 python -m rc2_telemetry_receiver \
-  --lab recipes/40007-version-keepalive.json
+  --lab recipes/40007-reconnect-snapshots.json
 ```
 
 The installed APK accepts new commands and socket strategies from JSON, so
@@ -59,10 +60,15 @@ errors. A port held by another hardware operation is rejected.
 Included strategies:
 
 ```text
-recipes/40007-version-keepalive.json
+recipes/40007-single-version-observe.json
+recipes/40007-single-version-lifetime.json
+recipes/40007-reconnect-snapshots.json
 recipes/40009-single-duml.json
 recipes/8902-passive-observe.json
 ```
+
+`recipes/40007-version-keepalive.json` is retained only as the known
+same-socket reset regression case; do not use it as the normal capture recipe.
 
 Edit a copy of a recipe for each experiment and retain its returned
 `DUML_LAB_RESULT` with the corresponding physical observations. The full
@@ -117,7 +123,7 @@ When capture already holds the requested port, the command returns
 Remote DUML is a bench research interface. An external local script may
 schedule one-shot requests, but the receiver does not start polling on its own.
 
-`1.5.3-research.10` accepts a correlated DJI reply even when the RESPONSE bit is
+`1.5.3-research.11` accepts a correlated DJI reply even when the RESPONSE bit is
 not set, matching the behavior documented by `dji-firmware-tools`. CRC,
 sequence, reverse routing and command set/ID must still match. This change is
 unit-tested. Every result also includes a bounded diagnostics block showing
@@ -125,12 +131,12 @@ whether the exchange matched, timed out, reached EOF, or received valid but
 unmatched DUML frames. Raw observed frames are retained as base64.
 
 The earlier `40009` bench run proved LAN relay and stable DJI Fly coexistence on
-the tested RC2, with 11,512 valid frames and no parser errors. A direct LAN
-check of the `research.10` keepalive pattern held `40007` open for 3.011 seconds,
-received 4,116 bytes and 92 CRC-valid frames while sending 40 keepalives. That
-short check did not contain `03/43` or `04/05`; continuous georeference-family
-delivery and DJI Fly coexistence remain physical gates. No ADB path is required
-or used by the current workflow.
+the tested RC2, with 11,512 valid frames and no parser errors. On 2026-07-25,
+Lab mode proved the `40007` socket is short-lived and must not be reused. Three
+one-hertz, one-command connections completed while DJI Fly was open, returning
+6,026 bytes and CRC-valid frames without parser errors or resets. Continuous
+georeference-family delivery and longer DJI Fly coexistence remain physical
+gates. No ADB path is required or used by the current workflow.
 
 The tool writes `session.ndjson`, raw chunk files, and `session-summary.json`.
 It does not upload artifacts or promote GPS/attitude fields to verified values.

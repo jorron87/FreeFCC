@@ -14,7 +14,7 @@ import org.json.JSONObject
 enum class TelemetrySourceMode(val wireName: String) {
     DumlLabControlOnly("duml_lab_control_only"),
     Rc2PublishStream("rc2_publish_8902"),
-    BenchWrappedKeepalive("bench_wrapped_keepalive"),
+    BenchWrappedSnapshots("bench_wrapped_snapshot_1hz"),
     BenchWrappedSocket("bench_wrapped_socket"),
     BenchDirectSocket("bench_direct_socket");
 
@@ -24,7 +24,7 @@ enum class TelemetrySourceMode(val wireName: String) {
                 CONTROL_ONLY_PORT -> DumlLabControlOnly
                 DumlTransport.PORT_ALT_2 -> Rc2PublishStream
                 DumlTransport.PORT_LED -> if (streamKeepaliveEnabled) {
-                    BenchWrappedKeepalive
+                    BenchWrappedSnapshots
                 } else {
                     BenchWrappedSocket
                 }
@@ -70,10 +70,12 @@ data class TelemetryHelloEvent(
         "source_policy" to when (config.sourceMode) {
             TelemetrySourceMode.DumlLabControlOnly -> "remote_bounded_recipes_no_capture"
             TelemetrySourceMode.Rc2PublishStream -> "persistent_read_only"
-            TelemetrySourceMode.BenchWrappedKeepalive -> "same_socket_idle_00_01_no_reconnect"
+            TelemetrySourceMode.BenchWrappedSnapshots -> "one_00_01_per_connection_1hz"
             else -> "explicit_single_connection"
         },
         "stream_keepalive_enabled" to config.streamKeepaliveEnabled,
+        "snapshot_mode_enabled" to
+            (config.sourceMode == TelemetrySourceMode.BenchWrappedSnapshots),
         "raw_relay_enabled" to config.rawRelayEnabled,
         "sample_interval_ms" to config.sampleIntervalMs,
         "source_id" to config.sourceId,
@@ -201,15 +203,18 @@ data class Rc2RecordStatsEvent(
     )
 }
 
-data class StreamKeepaliveStatsEvent(
+data class SnapshotStatsEvent(
     val sessionId: String,
     val elapsedRealtimeNs: Long,
     val source: String,
     val port: Int,
-    val sentCount: Long,
-    val readTimeoutMs: Int,
-    val idleTimeoutsBeforeSend: Int
-) : TelemetryEvent("STREAM_KEEPALIVE_STATS") {
+    val attemptCount: Long,
+    val successCount: Long,
+    val failureCount: Long,
+    val rxBytes: Int,
+    val frameCount: Int,
+    val intervalMs: Long
+) : TelemetryEvent("SNAPSHOT_STATS") {
     override fun toJsonLine(): String = jsonObject(
         "type" to type,
         "schema" to TELEMETRY_SCHEMA,
@@ -218,11 +223,15 @@ data class StreamKeepaliveStatsEvent(
         "elapsed_realtime_ns" to elapsedRealtimeNs,
         "source" to source,
         "port" to port,
-        "sent_count" to sentCount,
-        "read_timeout_ms" to readTimeoutMs,
-        "idle_timeouts_before_send" to idleTimeoutsBeforeSend,
+        "attempt_count" to attemptCount,
+        "success_count" to successCount,
+        "failure_count" to failureCount,
+        "last_rx_bytes" to rxBytes,
+        "last_frame_count" to frameCount,
+        "interval_ms" to intervalMs,
         "command_family" to "00/01",
-        "route" to "02>06"
+        "route" to "02>06",
+        "connection_policy" to "one_command_per_connection"
     )
 }
 

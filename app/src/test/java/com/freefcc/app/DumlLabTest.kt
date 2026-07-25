@@ -120,7 +120,7 @@ class DumlLabTest {
                     }
                     received.set(requestBytes.copyOf(offset))
                     socket.getOutputStream().apply {
-                        write(SameSocketTelemetryKeepalive.wrap(response))
+                        write(WrappedSnapshotInquiry.wrap(response))
                         flush()
                     }
                 }

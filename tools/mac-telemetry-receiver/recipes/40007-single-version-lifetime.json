@@ -1,0 +1,89 @@
+{
+  "schema": "duml-lab/v1",
+  "name": "40007 single version inquiry socket lifetime",
+  "port": 40007,
+  "connect_timeout_ms": 2000,
+  "total_timeout_ms": 7000,
+  "max_rx_bytes": 262144,
+  "setup": [
+    {
+      "op": "connect",
+      "label": "open one persistent socket"
+    },
+    {
+      "op": "write_duml",
+      "label": "single version inquiry",
+      "sender": 2,
+      "destination": 6,
+      "cmd_type": 0,
+      "cmd_set": 0,
+      "cmd_id": 1,
+      "payload_b64": "",
+      "wire": "wrapped_40007"
+    },
+    {
+      "op": "read",
+      "label": "capture initial burst",
+      "duration_ms": 1000,
+      "idle_timeout_ms": 100,
+      "max_bytes": 65536
+    }
+  ],
+  "cycle": [
+    {
+      "op": "sleep",
+      "label": "quiet 100 ms",
+      "duration_ms": 100
+    },
+    {
+      "op": "read",
+      "label": "observe after 100 ms",
+      "duration_ms": 150,
+      "idle_timeout_ms": 100,
+      "max_bytes": 65536
+    },
+    {
+      "op": "sleep",
+      "label": "quiet 250 ms",
+      "duration_ms": 250
+    },
+    {
+      "op": "read",
+      "label": "observe after another 250 ms",
+      "duration_ms": 150,
+      "idle_timeout_ms": 100,
+      "max_bytes": 65536
+    },
+    {
+      "op": "sleep",
+      "label": "quiet 500 ms",
+      "duration_ms": 500
+    },
+    {
+      "op": "read",
+      "label": "observe after another 500 ms",
+      "duration_ms": 150,
+      "idle_timeout_ms": 100,
+      "max_bytes": 65536
+    },
+    {
+      "op": "sleep",
+      "label": "quiet 1000 ms",
+      "duration_ms": 1000
+    },
+    {
+      "op": "read",
+      "label": "observe after another 1000 ms",
+      "duration_ms": 1100,
+      "idle_timeout_ms": 1000,
+      "max_bytes": 65536
+    }
+  ],
+  "cycle_count": 1,
+  "teardown": [
+    {
+      "op": "close",
+      "label": "explicit close"
+    }
+  ]
+}

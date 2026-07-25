@@ -39,17 +39,18 @@ The Mac receiver owns:
 
 ## Controller source policy
 
-`40007 Keepalive` is the current bench source. It:
+`40007 1Hz` is the current bench source. It:
 
-1. opens one `127.0.0.1:40007` socket;
-2. immediately sends a wrapped `02 -> 06`, `00/01` Version Inquiry;
-3. sends another only after two consecutive 20 ms idle reads;
-4. reads and validates wrapped DUML on the same socket;
-5. never reconnects automatically;
-6. marks EOF, write failure or a two-second source gap unavailable.
+1. opens a new `127.0.0.1:40007` socket for each sample window;
+2. sends exactly one wrapped `02 -> 06`, `00/01` Version Inquiry;
+3. reads for at most 500 ms and stops after 100 ms idle;
+4. validates wrapped DUML and closes the socket;
+5. paces the next bounded connection at one hertz;
+6. marks empty, malformed or failed snapshots unavailable before retrying.
 
 This is active bench behavior, not a flight-safe claim. The older periodic
-`03/44` primer is retired because its second write reset the tested RC2 socket.
+`03/44` primer and same-socket `00/01` keepalive are retired because a second
+write reset the tested RC2 socket.
 
 ## DUML Lab boundary
 
@@ -163,13 +164,13 @@ but does not publish MQTT.
 
 ## Remaining physical gate
 
-Install `1.5.3-research.10`, keep propellers off and DJI Fly in the foreground,
-then run `40007 Keepalive` for at least ten minutes.
+Install `1.5.3-research.11`, keep propellers off and DJI Fly in the foreground,
+then run `40007 1Hz` for at least ten minutes.
 
 Acceptance requires:
 
 1. zero DJI Fly reconnects, control-link warnings or pairing changes;
-2. one uninterrupted app session and no automatic capture reconnect;
+2. one uninterrupted app session with one bounded connection per snapshot;
 3. repeated CRC-valid `03/43` and `04/05` frames;
 4. fresh one-second samples with nulls after deliberate source loss;
 5. heading and gimbal pitch following controlled movements;

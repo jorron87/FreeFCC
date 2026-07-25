@@ -106,7 +106,7 @@ class TelemetryEventsTest {
     }
 
     @Test
-    fun `hello records same socket stream keepalive policy`() {
+    fun `hello records one command per connection snapshot policy`() {
         val line = TelemetryHelloEvent(
             sessionId = "session-3",
             config = TelemetryConfig(
@@ -120,9 +120,10 @@ class TelemetryEventsTest {
             controllerModel = "rc331"
         ).toJsonLine()
 
-        assertTrue(line.contains("\"source_mode\":\"bench_wrapped_keepalive\""))
-        assertTrue(line.contains("\"source_policy\":\"same_socket_idle_00_01_no_reconnect\""))
+        assertTrue(line.contains("\"source_mode\":\"bench_wrapped_snapshot_1hz\""))
+        assertTrue(line.contains("\"source_policy\":\"one_00_01_per_connection_1hz\""))
         assertTrue(line.contains("\"stream_keepalive_enabled\":true"))
+        assertTrue(line.contains("\"snapshot_mode_enabled\":true"))
     }
 
     @Test
@@ -145,19 +146,24 @@ class TelemetryEventsTest {
     }
 
     @Test
-    fun `stream keepalive stats preserve command and cadence evidence`() {
-        val line = StreamKeepaliveStatsEvent(
+    fun `snapshot stats preserve command and connection evidence`() {
+        val line = SnapshotStatsEvent(
             sessionId = "session-4",
             elapsedRealtimeNs = 5_000_000_000,
-            source = "bench_wrapped_keepalive",
+            source = "bench_wrapped_snapshot_1hz",
             port = 40007,
-            sentCount = 17,
-            readTimeoutMs = 20,
-            idleTimeoutsBeforeSend = 2
+            attemptCount = 17,
+            successCount = 16,
+            failureCount = 1,
+            rxBytes = 4116,
+            frameCount = 92,
+            intervalMs = 1000
         ).toJsonLine()
 
-        assertTrue(line.contains("\"type\":\"STREAM_KEEPALIVE_STATS\""))
-        assertTrue(line.contains("\"sent_count\":17"))
+        assertTrue(line.contains("\"type\":\"SNAPSHOT_STATS\""))
+        assertTrue(line.contains("\"attempt_count\":17"))
+        assertTrue(line.contains("\"success_count\":16"))
+        assertTrue(line.contains("\"connection_policy\":\"one_command_per_connection\""))
         assertTrue(line.contains("\"command_family\":\"00/01\""))
         assertTrue(line.contains("\"route\":\"02>06\""))
     }
@@ -183,7 +189,7 @@ class TelemetryEventsTest {
     fun `relay serialization freezes capture wall time before reconnect backlog`() {
         val event = TelemetryTickEvent(
             sessionId = "session-queue",
-            source = "bench_wrapped_keepalive",
+            source = "bench_wrapped_snapshot_1hz",
             port = 40007,
             elapsedRealtimeNs = 9_000_000_000,
             sourceStatus = "active",

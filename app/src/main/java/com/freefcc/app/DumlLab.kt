@@ -531,7 +531,7 @@ internal class DumlLabEngine(
                                 )
                             )
                             bytes = if (step.wireFormat == DumlLabWireFormat.Wrapped40007) {
-                                SameSocketTelemetryKeepalive.wrap(direct)
+                                WrappedSnapshotInquiry.wrap(direct)
                             } else {
                                 direct
                             }
