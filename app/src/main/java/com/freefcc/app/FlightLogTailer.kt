@@ -6,7 +6,7 @@ import java.io.RandomAccessFile
 internal class FlightLogTailer(
     private val directories: List<File> = DEFAULT_DIRECTORIES,
     private val maxChunkBytes: Int = DEFAULT_CHUNK_BYTES
-) {
+) : FlightLogPoller {
     sealed interface PollResult {
         data class Chunk(
             val logName: String,
@@ -24,7 +24,7 @@ internal class FlightLogTailer(
     private var activePath: String? = null
     private var offset = 0L
 
-    fun poll(): PollResult {
+    override fun poll(): PollResult {
         val directory = directories.firstOrNull { it.isDirectory }
             ?: return PollResult.Unavailable(
                 "DJI Fly FlightRecord directory is not visible at ${directories.joinToString { it.path }}"

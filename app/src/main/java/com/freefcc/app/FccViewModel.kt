@@ -66,6 +66,7 @@ data class AppState(
     val telemetryDjiFlyVersion: String = "",
     val telemetryAircraftModel: String = "",
     val telemetryAircraftFirmware: String = "",
+    val telemetryFlightLogTreeUri: String = "",
     val telemetryRuntime: TelemetryRuntimeState = TelemetryRuntimeState(),
     val telemetryProbeBusy: Boolean = false,
     val telemetryProbeResult: TelemetryProbeResult? = null,
@@ -85,7 +86,7 @@ data class AppState(
 class FccViewModel(private val app: Application) : AndroidViewModel(app) {
 
     companion object {
-        const val APP_VERSION = "1.5.3-research.15"
+        const val APP_VERSION = "1.5.3-research.16"
         private const val SETTINGS_FRAGMENT_ARGS_KEY = ":settings:fragment_args_key"
         private const val SETTINGS_SHOW_FRAGMENT_ARGS = ":settings:show_fragment_args"
 
@@ -172,6 +173,8 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
                 telemetryDjiFlyVersion = prefs.getString("telemetry_dji_fly_version", "").orEmpty(),
                 telemetryAircraftModel = prefs.getString("telemetry_aircraft_model", "").orEmpty(),
                 telemetryAircraftFirmware = prefs.getString("telemetry_aircraft_firmware", "").orEmpty(),
+                telemetryFlightLogTreeUri =
+                    prefs.getString(FlightLogAccess.PREF_TREE_URI, "").orEmpty(),
                 updateEndpoint = updateEndpoint
             )
         }
@@ -323,6 +326,18 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
     fun updateTelemetryAircraftFirmware(value: String) {
         prefs.edit().putString("telemetry_aircraft_firmware", value.trim()).apply()
         update { copy(telemetryAircraftFirmware = value.trim()) }
+    }
+
+    fun setTelemetryFlightLogTreeUri(value: String) {
+        prefs.edit().putString(FlightLogAccess.PREF_TREE_URI, value).apply()
+        update { copy(telemetryFlightLogTreeUri = value) }
+        log(
+            if (value.isBlank()) {
+                "Live FlightRecord folder access cleared"
+            } else {
+                "Live FlightRecord folder access granted"
+            }
+        )
     }
 
     fun startTelemetryRelay() {

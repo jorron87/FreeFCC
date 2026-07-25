@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
@@ -187,12 +188,23 @@ class TelemetryCaptureService : Service() {
     }
 
     private suspend fun runFlightLogTail(config: TelemetryConfig) {
-        val tailer = FlightLogTailer()
+        val treeUri = getSharedPreferences("freefcc", Context.MODE_PRIVATE)
+            .getString(FlightLogAccess.PREF_TREE_URI, "")
+            .orEmpty()
+        val tailer: FlightLogPoller = if (treeUri.isNotBlank()) {
+            FlightLogDocumentTailer(this, Uri.parse(treeUri))
+        } else {
+            FlightLogTailer()
+        }
         sourceStatus = "open_waiting"
         emitSourceStatus(
             config,
             sourceStatus,
-            "Reading DJI Fly FlightRecord mirror; waiting for a growing log"
+            if (treeUri.isNotBlank()) {
+                "Reading DJI Fly FlightRecord through persisted SAF live access"
+            } else {
+                "Reading delayed public FlightRecord mirror; SAF live access is not selected"
+            }
         )
         TelemetryStatusBus.update(
             TelemetryStatus(

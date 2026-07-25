@@ -3,6 +3,7 @@ package com.freefcc.app
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.provider.DocumentsContract
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -75,6 +76,21 @@ class MainActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
     private val storagePermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private val flightLogFolderPicker =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            if (uri != null) {
+                runCatching {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                }.onSuccess {
+                    viewModel.setTelemetryFlightLogTreeUri(uri.toString())
+                }.onFailure {
+                    viewModel.setTelemetryFlightLogTreeUri("")
+                }
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -103,7 +119,12 @@ class MainActivity : ComponentActivity() {
                     error = Red, secondary = Green, tertiary = Amber
                 )
             ) {
-                AppRoot(viewModel)
+                AppRoot(
+                    viewModel = viewModel,
+                    onPickFlightLogFolder = {
+                        flightLogFolderPicker.launch(FLIGHT_LOG_INITIAL_URI)
+                    }
+                )
             }
         }
     }
@@ -119,7 +140,10 @@ class MainActivity : ComponentActivity() {
 // ═══════════════════════════════════════════════════════════════════════
 
 @Composable
-private fun AppRoot(viewModel: FccViewModel) {
+private fun AppRoot(
+    viewModel: FccViewModel,
+    onPickFlightLogFolder: () -> Unit
+) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val pagerState = rememberPagerState(initialPage = 0) { 6 }
     val scope = rememberCoroutineScope()
@@ -165,7 +189,7 @@ private fun AppRoot(viewModel: FccViewModel) {
             when (page) {
                 0 -> FccPage(state, viewModel)
                 1 -> InfoPage(state, viewModel)
-                2 -> TelemetryPage(state, viewModel)
+                2 -> TelemetryPage(state, viewModel, onPickFlightLogFolder)
                 3 -> LogPage(state)
                 4 -> UpdatePage(state, viewModel)
                 5 -> SupportPage()
@@ -189,7 +213,11 @@ private fun AppRoot(viewModel: FccViewModel) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
+private fun TelemetryPage(
+    state: AppState,
+    viewModel: FccViewModel,
+    onPickFlightLogFolder: () -> Unit
+) {
     val runtime = state.telemetryRuntime
     Column(
         modifier = Modifier
@@ -347,7 +375,11 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 if (state.telemetryCapturePort == CONTROL_ONLY_PORT.toString()) {
                     "CONTROL ONLY: DJI ports stay free; visible DJI Fly labels relay through Accessibility."
                 } else if (state.telemetryCapturePort == FLIGHT_LOG_SOURCE_PORT.toString()) {
-                    "READ ONLY: follows DJI Fly's public Download flight-log mirror without opening a DJI socket."
+                    if (state.telemetryFlightLogTreeUri.isNotBlank()) {
+                        "READ ONLY: SAF live access selected for DJI Fly FlightRecord."
+                    } else {
+                        "DELAYED: public Download mirror is copied after DJI Fly flushes the log."
+                    }
                 } else if (state.telemetryStreamKeepaliveEnabled) {
                     "ACTIVE BENCH: one wrapped 00/01 per short-lived connection, paced at 1 Hz."
                 } else {
@@ -355,6 +387,21 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
                 },
                 if (state.telemetryStreamKeepaliveEnabled) Amber else TextDim
             )
+            if (state.telemetryCapturePort == FLIGHT_LOG_SOURCE_PORT.toString()) {
+                Spacer(Modifier.height(12.dp))
+                InfoRow(
+                    "Live log access",
+                    if (state.telemetryFlightLogTreeUri.isBlank()) "NOT SELECTED" else "SAF GRANTED",
+                    if (state.telemetryFlightLogTreeUri.isBlank()) Amber else Green
+                )
+                Spacer(Modifier.height(12.dp))
+                GlowButton(
+                    "Select FlightRecord folder",
+                    Cyan,
+                    filled = false,
+                    enabled = !runtime.running
+                ) { onPickFlightLogFolder() }
+            }
             Spacer(Modifier.height(14.dp))
             InfoRow(
                 "DJI Fly UI access",
@@ -487,6 +534,11 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
         }
     }
 }
+
+private val FLIGHT_LOG_INITIAL_URI: Uri = DocumentsContract.buildDocumentUri(
+    "com.android.externalstorage.documents",
+    "primary:Android/data/dji.go.v5/files/FlightRecord"
+)
 
 private fun candidateNumber(value: Double?, decimals: Int): String =
     value?.let { String.format(java.util.Locale.US, "%.${decimals}f", it) } ?: "unknown"

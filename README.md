@@ -185,10 +185,11 @@ Each command is a small binary packet with a magic byte (`0x55`), a header with 
 
 This fork adds a separate Telemetry tab for raw metadata research. It can stream `RAW_CHUNK` and validated `DUML_FRAME` NDJSON records to a local Mac on port `8765`.
 
-`1.5.3-research.15` adds a preferred read-only DJI Fly flight-log source. It
-first follows the RC2 public mirror at
-`Download/product_data/flightRecords`, then falls back to DJI Fly's private
-`Android/data` directory when that is readable.
+`1.5.3-research.16` adds persisted SAF access for the live DJI Fly
+`Android/data/dji.go.v5/files/FlightRecord` directory. Select that directory
+once through the RC2 DocumentsUI picker before starting the Log relay. Without
+SAF access, the source falls back to the delayed public mirror at
+`Download/product_data/flightRecords`.
 `Flight Log Tail` follows
 `/storage/emulated/0/Android/data/dji.go.v5/files/FlightRecord`, emits
 offset-addressed `FLIGHT_LOG_CHUNK` records, and opens no DJI controller
@@ -331,7 +332,7 @@ accepted a LAN connection but stayed byte-silent in foreground, DJI Fly and
 handoff tests. `research.12` therefore introduced `Lab only` as the
 non-invasive runtime and the Accessibility UI snapshot stream for live label
 discovery. `research.13` adds direct access to the RC2's otherwise hidden
-Accessibility panel. `research.15` adds the DJI Fly flight-log tail after MTP
+Accessibility panel. `research.16` adds the DJI Fly flight-log tail after MTP
 confirmed the log directory and a partially written v14 log decoded 92
 complete frames while safely rejecting its truncated final record.
 
@@ -356,7 +357,7 @@ and periodic `07/19`/`07/30` country traffic does not improve metadata capture.
 The structured RM510 `51/14` layout is the relevant change adopted in this
 release.
 
-Current research build: `1.5.3-research.15`. It remains bench-only until its
+Current research build: `1.5.3-research.16`. It remains bench-only until its
 physical RC2 gate has passed. See
 [`docs/TELEMETRY_ARCHITECTURE.md`](docs/TELEMETRY_ARCHITECTURE.md) for the
 transport boundary and acceptance gates.

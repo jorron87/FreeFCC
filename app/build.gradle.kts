@@ -14,8 +14,8 @@ android {
         applicationId = "com.freefcc.app"
         minSdk = 29
         targetSdk = 29
-        versionCode = 34
-        versionName = "1.5.3-research.15"
+        versionCode = 35
+        versionName = "1.5.3-research.16"
     }
 
     val keystorePropsFile = rootProject.file("keystore.properties")
@@ -100,6 +100,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.documentfile:documentfile:1.0.1")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
