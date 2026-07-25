@@ -85,7 +85,7 @@ data class AppState(
 class FccViewModel(private val app: Application) : AndroidViewModel(app) {
 
     companion object {
-        const val APP_VERSION = "1.5.3-research.13"
+        const val APP_VERSION = "1.5.3-research.14"
         private const val SETTINGS_FRAGMENT_ARGS_KEY = ":settings:fragment_args_key"
         private const val SETTINGS_SHOW_FRAGMENT_ARGS = ":settings:show_fragment_args"
 
@@ -333,7 +333,8 @@ class FccViewModel(private val app: Application) : AndroidViewModel(app) {
             current.telemetryHost.isBlank() ||
             port == null || port !in 1..65535 ||
             capturePort == null ||
-            (capturePort != CONTROL_ONLY_PORT &&
+            (capturePort != FLIGHT_LOG_SOURCE_PORT &&
+                capturePort != CONTROL_ONLY_PORT &&
                 capturePort !in TelemetryRelayClient.RESEARCH_DUML_PORTS)
         ) {
             update { copy(message = "Enter a valid Mac endpoint and supported telemetry source.") }

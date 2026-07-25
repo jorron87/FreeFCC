@@ -12,6 +12,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 enum class TelemetrySourceMode(val wireName: String) {
+    DjiFlyFlightLogTail("dji_fly_flight_log_tail"),
     DumlLabControlOnly("duml_lab_control_only"),
     Rc2PublishStream("rc2_publish_8902"),
     BenchWrappedSnapshots("bench_wrapped_snapshot_1hz"),
@@ -21,6 +22,7 @@ enum class TelemetrySourceMode(val wireName: String) {
     companion object {
         fun forPort(port: Int, streamKeepaliveEnabled: Boolean = false): TelemetrySourceMode =
             when (port) {
+                FLIGHT_LOG_SOURCE_PORT -> DjiFlyFlightLogTail
                 CONTROL_ONLY_PORT -> DumlLabControlOnly
                 DumlTransport.PORT_ALT_2 -> Rc2PublishStream
                 DumlTransport.PORT_LED -> if (streamKeepaliveEnabled) {
@@ -68,6 +70,7 @@ data class TelemetryHelloEvent(
         "source_mode" to config.sourceMode.wireName,
         "source_port" to config.capturePort,
         "source_policy" to when (config.sourceMode) {
+            TelemetrySourceMode.DjiFlyFlightLogTail -> "read_only_growing_file_offset_chunks"
             TelemetrySourceMode.DumlLabControlOnly -> "remote_bounded_recipes_no_capture"
             TelemetrySourceMode.Rc2PublishStream -> "persistent_read_only"
             TelemetrySourceMode.BenchWrappedSnapshots -> "one_00_01_per_connection_1hz"
@@ -89,6 +92,33 @@ data class TelemetryHelloEvent(
         "device" to (Build.DEVICE ?: "unknown"),
         "elapsed_realtime_ns" to elapsedRealtimeNs,
         "created_at" to utcNow()
+    )
+}
+
+data class FlightLogChunkEvent(
+    val sessionId: String,
+    val seq: Long,
+    val elapsedRealtimeNs: Long,
+    val logName: String,
+    val offset: Long,
+    val fileSize: Long,
+    val newFile: Boolean,
+    val bytes: ByteArray
+) : TelemetryEvent("FLIGHT_LOG_CHUNK") {
+    override fun toJsonLine(): String = jsonObject(
+        "type" to type,
+        "schema" to TELEMETRY_SCHEMA,
+        "session_id" to sessionId,
+        "seq" to seq,
+        "wall_time_utc" to utcNow(),
+        "elapsed_realtime_ns" to elapsedRealtimeNs,
+        "source" to TelemetrySourceMode.DjiFlyFlightLogTail.wireName,
+        "log_name" to logName,
+        "offset" to offset,
+        "file_size" to fileSize,
+        "new_file" to newFile,
+        "bytes_b64" to b64(bytes),
+        "crc32" to crc32Hex(bytes)
     )
 }
 
@@ -464,6 +494,7 @@ fun crc32Hex(bytes: ByteArray): String {
 }
 
 internal const val TELEMETRY_SCHEMA = "dji-rc2-telemetry/v2"
+internal const val FLIGHT_LOG_SOURCE_PORT = -1
 internal const val CONTROL_ONLY_PORT = 0
 
 private fun b64(bytes: ByteArray): String = Base64.getEncoder().encodeToString(bytes)

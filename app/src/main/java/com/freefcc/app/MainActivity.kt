@@ -73,6 +73,8 @@ class MainActivity : ComponentActivity() {
     private val viewModel: FccViewModel by viewModels()
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private val storagePermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -82,6 +84,13 @@ class MainActivity : ComponentActivity() {
             PackageManager.PERMISSION_GRANTED
         ) {
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (
+            Build.VERSION.SDK_INT <= Build.VERSION_CODES.S_V2 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            storagePermission.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
         viewModel.init()
 
@@ -242,6 +251,8 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
             BodyText(
                 if (runtime.sourceMode == "duml_lab_control_only") {
                     "Mac-controlled bounded DUML recipes; no controller capture port is held."
+                } else if (runtime.sourceMode == "dji_fly_flight_log_tail") {
+                    "Read-only tail of DJI Fly FlightRecord; no DUML socket is opened."
                 } else if (runtime.sourceMode == "bench_wrapped_snapshot_1hz") {
                     "One wrapped 00/01 command per short-lived 40007 connection, paced at 1 Hz."
                 } else {
@@ -307,10 +318,10 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
             Spacer(Modifier.height(8.dp))
             SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                 listOf(
+                    Triple("Log", FLIGHT_LOG_SOURCE_PORT, false),
                     Triple("Lab", CONTROL_ONLY_PORT, false),
                     Triple("8902", 8902, false),
-                    Triple("40007 1Hz", 40007, true),
-                    Triple("40007 Snap", 40007, false)
+                    Triple("40007 1Hz", 40007, true)
                 ).forEachIndexed { index, choice ->
                     SegmentedButton(
                         selected = state.telemetryCapturePort == choice.second.toString() &&
@@ -335,6 +346,8 @@ private fun TelemetryPage(state: AppState, viewModel: FccViewModel) {
             BodyText(
                 if (state.telemetryCapturePort == CONTROL_ONLY_PORT.toString()) {
                     "CONTROL ONLY: DJI ports stay free; visible DJI Fly labels relay through Accessibility."
+                } else if (state.telemetryCapturePort == FLIGHT_LOG_SOURCE_PORT.toString()) {
+                    "READ ONLY: follows Android/data/dji.go.v5/files/FlightRecord without opening a DJI socket."
                 } else if (state.telemetryStreamKeepaliveEnabled) {
                     "ACTIVE BENCH: one wrapped 00/01 per short-lived connection, paced at 1 Hz."
                 } else {

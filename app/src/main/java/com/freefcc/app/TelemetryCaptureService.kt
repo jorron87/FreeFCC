@@ -79,7 +79,8 @@ class TelemetryCaptureService : Service() {
         if (
             host.isBlank() ||
             port !in 1..65535 ||
-            (capturePort != CONTROL_ONLY_PORT &&
+            (capturePort != FLIGHT_LOG_SOURCE_PORT &&
+                capturePort != CONTROL_ONLY_PORT &&
                 capturePort !in TelemetryRelayClient.RESEARCH_DUML_PORTS) ||
             (intent.getBooleanExtra(EXTRA_STREAM_KEEPALIVE_ENABLED, false) &&
                 capturePort != DumlTransport.PORT_LED)
@@ -176,12 +177,110 @@ class TelemetryCaptureService : Service() {
             }
         } else {
             captureJob = scope.launch {
-                if (config.sourceMode == TelemetrySourceMode.BenchWrappedSnapshots) {
-                    runWrappedSnapshotCapture(config)
-                } else {
-                    runCapture(config)
+                when (config.sourceMode) {
+                    TelemetrySourceMode.DjiFlyFlightLogTail -> runFlightLogTail(config)
+                    TelemetrySourceMode.BenchWrappedSnapshots -> runWrappedSnapshotCapture(config)
+                    else -> runCapture(config)
                 }
             }
+        }
+    }
+
+    private suspend fun runFlightLogTail(config: TelemetryConfig) {
+        val tailer = FlightLogTailer()
+        sourceStatus = "open_waiting"
+        emitSourceStatus(
+            config,
+            sourceStatus,
+            "Reading DJI Fly FlightRecord directory; waiting for a growing log"
+        )
+        TelemetryStatusBus.update(
+            TelemetryStatus(
+                connecting = false,
+                captureActive = true,
+                sourcePort = FLIGHT_LOG_SOURCE_PORT,
+                sourceStatus = sourceStatus,
+                lastError = ""
+            )
+        )
+
+        while (currentCoroutineContext().isActive) {
+            when (val result = tailer.poll()) {
+                is FlightLogTailer.PollResult.Chunk -> {
+                    val capturedElapsedNs = SystemClock.elapsedRealtimeNanos()
+                    val seq = ++rawSeq
+                    rawChunks += 1
+                    byteCount += result.bytes.size
+                    lastByteElapsedNs = capturedElapsedNs
+                    if (sourceStatus != "active") {
+                        sourceStatus = "active"
+                        emitSourceStatus(
+                            config,
+                            sourceStatus,
+                            "Following ${result.logName} at offset ${result.offset}"
+                        )
+                    }
+                    if (
+                        relay?.enqueue(
+                            FlightLogChunkEvent(
+                                sessionId = sessionId,
+                                seq = seq,
+                                elapsedRealtimeNs = capturedElapsedNs,
+                                logName = result.logName,
+                                offset = result.offset,
+                                fileSize = result.fileSize,
+                                newFile = result.newFile,
+                                bytes = result.bytes
+                            )
+                        ) != true
+                    ) {
+                        return
+                    }
+                    emitTickIfDue(config, capturedElapsedNs)
+                    TelemetryStatusBus.update(
+                        TelemetryStatus(
+                            running = true,
+                            captureActive = true,
+                            sourceStatus = sourceStatus,
+                            rawChunks = rawChunks,
+                            bytes = byteCount,
+                            lastError = ""
+                        )
+                    )
+                }
+                is FlightLogTailer.PollResult.Waiting -> {
+                    val nowNs = SystemClock.elapsedRealtimeNanos()
+                    val ageMs = lastByteAgeMs(nowNs)
+                    val nextStatus = if (
+                        lastByteElapsedNs > 0L &&
+                        ageMs != null &&
+                        ageMs >= SOURCE_GAP_AFTER_MS
+                    ) {
+                        "gap"
+                    } else {
+                        "open_waiting"
+                    }
+                    if (nextStatus != sourceStatus) {
+                        sourceStatus = nextStatus
+                        emitSourceStatus(config, nextStatus, result.detail)
+                        if (nextStatus == "gap") {
+                            relay?.enqueue(
+                                TelemetryUnavailableEvent(
+                                    sessionId = sessionId,
+                                    sourceId = config.sourceId,
+                                    reason = result.detail
+                                )
+                            )
+                        }
+                    }
+                    emitTickIfDue(config, nowNs)
+                }
+                is FlightLogTailer.PollResult.Unavailable -> {
+                    reportCaptureGap(config, result.detail)
+                    return
+                }
+            }
+            delay(FLIGHT_LOG_POLL_MS)
         }
     }
 
@@ -947,7 +1046,11 @@ class TelemetryCaptureService : Service() {
         )
         updateNotification(
             when (status) {
-                "active" -> "Metadata active on ${config.capturePort}"
+                "active" -> if (config.sourceMode == TelemetrySourceMode.DjiFlyFlightLogTail) {
+                    "DJI Fly flight log active"
+                } else {
+                    "Metadata active on ${config.capturePort}"
+                }
                 "open_silent" -> "Port ${config.capturePort} open; waiting for data"
                 "gap" -> "Metadata gap on ${config.capturePort}"
                 "unavailable" -> "Metadata unavailable"
@@ -1094,6 +1197,7 @@ class TelemetryCaptureService : Service() {
         private const val SNAPSHOT_MAX_RX_BYTES = 256 * 1024
         private const val MIN_COMMAND_INTERVAL_MS = 500L
         private const val UI_SNAPSHOT_RELAY_POLL_MS = 250L
+        private const val FLIGHT_LOG_POLL_MS = 500L
         private const val DEFAULT_RELAY_PORT = 8765
 
         private const val ACTION_START = "com.freefcc.app.telemetry.START"

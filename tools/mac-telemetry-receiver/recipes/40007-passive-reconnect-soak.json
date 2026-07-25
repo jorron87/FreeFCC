@@ -1,0 +1,38 @@
+{
+  "schema": "duml-lab/v1",
+  "name": "40007 passive reconnect soak",
+  "port": 40007,
+  "connect_timeout_ms": 2000,
+  "total_timeout_ms": 20000,
+  "max_rx_bytes": 262144,
+  "setup": [],
+  "cycle": [
+    {
+      "op": "connect",
+      "label": "open passive wrapped socket"
+    },
+    {
+      "op": "read",
+      "label": "observe without writes",
+      "duration_ms": 1000,
+      "idle_timeout_ms": 800,
+      "max_bytes": 65536
+    },
+    {
+      "op": "close",
+      "label": "close passive socket"
+    },
+    {
+      "op": "sleep",
+      "label": "short pacing gap",
+      "duration_ms": 200
+    }
+  ],
+  "cycle_count": 10,
+  "teardown": [
+    {
+      "op": "close",
+      "label": "ensure closed"
+    }
+  ]
+}

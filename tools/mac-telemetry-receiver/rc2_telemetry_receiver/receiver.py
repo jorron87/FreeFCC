@@ -180,6 +180,7 @@ class SessionStats:
     invalidated_fields: set[str] = field(default_factory=set)
     gnss_readiness: dict[str, Any] = field(default_factory=dict)
     sink_errors: int = 0
+    flight_log_files: dict[str, int] = field(default_factory=dict)
 
 
 class SessionWriter:
@@ -195,6 +196,7 @@ class SessionWriter:
         self.ndjson_path: Path | None = None
         self.raw_dir: Path | None = None
         self.raw_stream_path: Path | None = None
+        self.flight_log_dir: Path | None = None
         self.stats = SessionStats()
         self.source_mode = ""
         self.georeference_sinks = tuple(georeference_sinks)
@@ -292,6 +294,7 @@ class SessionWriter:
         safe_session = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in session_id)[:64]
         self.session_dir = self.out_root / f"{stamp}-{safe_session}"
         self.raw_dir = self.session_dir / "raw"
+        self.flight_log_dir = self.session_dir / "flight-logs"
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.ndjson_path = self.session_dir / "session.ndjson"
         self.raw_stream_path = self.session_dir / "raw-stream.bin"
@@ -311,6 +314,56 @@ class SessionWriter:
                 assert self.raw_stream_path is not None
                 with self.raw_stream_path.open("ab") as stream:
                     stream.write(data)
+        elif event.get("type") == "FLIGHT_LOG_CHUNK":
+            self._write_flight_log_chunk(event)
+
+    def _write_flight_log_chunk(self, event: dict[str, Any]) -> None:
+        assert self.flight_log_dir is not None
+        raw_name = Path(str(event.get("log_name") or "FlightRecord_unknown.txt")).name
+        safe_name = "".join(
+            character if character.isalnum() or character in "._-[]" else "_"
+            for character in raw_name
+        )[:180]
+        data = base64.b64decode(str(event.get("bytes_b64", "")))
+        expected_crc = str(event.get("crc32") or "").lower()
+        if expected_crc and expected_crc != crc32_hex(data):
+            self.stats.parser_errors += 1
+            self.stats.capture_state = "unavailable"
+            self.stats.last_error = "flight_log_chunk_crc32_mismatch"
+            return
+
+        offset = int(event.get("offset", -1))
+        if offset < 0:
+            self.stats.parser_errors += 1
+            self.stats.capture_state = "unavailable"
+            self.stats.last_error = "flight_log_chunk_invalid_offset"
+            return
+
+        self.flight_log_dir.mkdir(parents=True, exist_ok=True)
+        path = self.flight_log_dir / safe_name
+        mode = "r+b" if path.exists() else "w+b"
+        with path.open(mode) as handle:
+            current_size = handle.seek(0, 2)
+            if bool(event.get("new_file")) and offset == 0:
+                handle.truncate(0)
+                current_size = 0
+            if offset > current_size:
+                self.stats.parser_errors += 1
+                self.stats.capture_state = "unavailable"
+                self.stats.last_error = (
+                    f"flight_log_chunk_gap:{safe_name}:{current_size}->{offset}"
+                )
+                return
+            if offset < current_size:
+                handle.seek(offset)
+                existing = handle.read(len(data))
+                if existing == data:
+                    self.stats.flight_log_files[safe_name] = current_size
+                    return
+                handle.truncate(offset)
+            handle.seek(offset)
+            handle.write(data)
+            self.stats.flight_log_files[safe_name] = handle.tell()
 
     def _is_publish_stream(self, event: dict[str, Any]) -> bool:
         return (
@@ -370,6 +423,14 @@ class SessionWriter:
                 self.stats.capture_state = "active"
                 if self.stats.last_error.startswith("capture_gap"):
                     self.stats.last_error = ""
+            self.stats.latest_elapsed_realtime_ns = int(
+                event.get("elapsed_realtime_ns", self.stats.latest_elapsed_realtime_ns) or 0
+            )
+        elif event_type == "FLIGHT_LOG_CHUNK":
+            self.stats.raw_chunks += 1
+            self.stats.bytes += len(base64.b64decode(str(event.get("bytes_b64", ""))))
+            if not self.stats.last_error.startswith("flight_log_chunk_"):
+                self.stats.capture_state = "active"
             self.stats.latest_elapsed_realtime_ns = int(
                 event.get("elapsed_realtime_ns", self.stats.latest_elapsed_realtime_ns) or 0
             )
@@ -751,6 +812,7 @@ class SessionWriter:
             "controller_identity": self.stats.controller_identity,
             "identity_quality": self.stats.identity_quality,
             "bytes": self.stats.bytes,
+            "flight_log_files": dict(sorted(self.stats.flight_log_files.items())),
             "last_error": self.stats.last_error,
             "command_pairs": dict(sorted(self.stats.command_pairs.items())),
             "georef": {

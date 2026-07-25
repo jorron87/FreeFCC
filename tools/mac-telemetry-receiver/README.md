@@ -123,6 +123,51 @@ When capture already holds the requested port, the command returns
 Remote DUML is a bench research interface. An external local script may
 schedule one-shot requests, but the receiver does not start polling on its own.
 
+Inspect nested flight-record packets found in captured `03/D7` frames:
+
+```sh
+python -m rc2_telemetry_receiver.flightrecord_analyze \
+  /path/to/session.ndjson \
+  --request-id REQUEST_ID \
+  --out-records /path/to/flight-record.bin
+```
+
+The parser preserves the three-byte D7 prefix, validates every nested record
+with DJI CRC-8/CRC-16, retains the encoded payload and exports validated records
+in capture order. Neo 2 payloads currently show a 16-byte block-cipher or
+block-compression pattern; the legacy Mavic XOR does not yield validated
+plaintext and is never promoted to telemetry. See
+[`../../docs/FLIGHT_RECORD_D7.md`](../../docs/FLIGHT_RECORD_D7.md).
+
+### DJI Fly flight-log oracle
+
+The optional
+[`olavbolav/dji-flightlog-parser`](https://github.com/olavbolav/dji-flightlog-parser)
+integration decodes a manually exported `DJIFlightRecord*.txt` into a
+one-Hz comparison stream:
+
+```sh
+python3.12 -m venv .venv-flightlog
+. .venv-flightlog/bin/activate
+python -m pip install -r requirements-flightlog.txt
+export DJI_FLIGHTLOG_APP_KEY='set-outside-shell-history'
+python -m rc2_telemetry_receiver.flightlog_oracle \
+  /path/to/DJIFlightRecord_....txt \
+  --allow-dji-keychain-api
+```
+
+The pinned parser requires Python 3.10 or newer. This Mac currently has
+Homebrew Python 3.12 at `/opt/homebrew/bin/python3.12`; the system `python3`
+is too old for this optional tool.
+
+The explicit flag is required because the parser sends encrypted keychain
+material to DJI OpenAPI to obtain v13+ decryption keys. The app key is read
+only from the named environment variable and is never written to output.
+Generated `*.oracle.ndjson` rows retain `candidate`/`unknown` quality labels.
+In particular, `altitude_candidate_msl_m` is the parser's home altitude plus
+takeoff-relative height and is not considered verified AMSL until correlated
+against an independent reference and the simultaneous D7 capture.
+
 `1.5.3-research.11` accepts a correlated DJI reply even when the RESPONSE bit is
 not set, matching the behavior documented by `dji-firmware-tools`. CRC,
 sequence, reverse routing and command set/ID must still match. This change is
@@ -140,6 +185,12 @@ gates. No ADB path is required or used by the current workflow.
 
 The tool writes `session.ndjson`, raw chunk files, and `session-summary.json`.
 It does not upload artifacts or promote GPS/attitude fields to verified values.
+
+When Android selects `Log`, `FLIGHT_LOG_CHUNK` events are reconstructed by
+filename and absolute byte offset under `flight-logs/`. CRC mismatch or an
+offset gap marks capture unavailable. A growing v14 file can be passed to
+`flightlog_oracle` repeatedly: complete records decode immediately, while an
+incomplete final record remains excluded until its remaining bytes arrive.
 
 ## Optional MQTT output
 

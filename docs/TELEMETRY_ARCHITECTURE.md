@@ -182,22 +182,24 @@ but does not publish MQTT.
 
 ## Remaining physical gate
 
-Install `1.5.3-research.13`, select `Lab only`, and start the relay. If
-`FreeFCC Home Point` is not enabled, the app opens the RC2's hidden
-Accessibility panel directly. Enable it, return to FreeFCC, then keep DJI Fly
-in the foreground.
+Install `1.5.3-research.14`, grant the requested storage permission, select
+`Log`, and start the relay. The source reads DJI Fly's growing
+`Android/data/dji.go.v5/files/FlightRecord/FlightRecord_*.txt` without opening
+a DUML socket. The Mac receiver reconstructs the log under the session's
+`flight-logs/` directory.
 
 Acceptance requires:
 
-1. one UI snapshot per second without DJI Fly reconnects or telemetry loss;
-2. raw labels retained in NDJSON and the latest bounded set in session summary;
-3. controlled movement tests identifying position, height, heading and gimbal
-   labels, if DJI exposes them through Accessibility;
-4. parsed values remaining candidate until controlled correlation;
-5. missing or stale UI fields represented as unavailable, never replayed as
-   current metadata;
-6. a separate passive DUML source before any DUML-derived field is called
-   flight-safe;
+1. the app can list the DJI Fly FlightRecord directory with DJI Fly foreground;
+2. a newly created file is relayed from offset zero and later chunks are
+   contiguous with matching CRC-32;
+3. a partial v14 file yields complete frames while its incomplete trailing
+   record is ignored;
+4. one-Hz decoded position, yaw, gimbal pitch and height remain candidate until
+   controlled correlation;
+5. missing or stale fields are unavailable, never replayed as current metadata;
+6. DJI Fly retains stable telemetry and control while FreeFCC tails in the
+   background;
 7. no MQTT backlog burst after broker or LAN interruption.
 
 The RC and drone do not need to be online for unit tests, replay, APK builds or

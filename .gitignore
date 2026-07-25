@@ -12,6 +12,7 @@ gradle/.gradle/
 *.idsig
 __pycache__/
 *.pyc
+.venv*/
 .kotlin/
 
 REMOTE_ID_INTERNAL.md

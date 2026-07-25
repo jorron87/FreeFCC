@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import io
 import json
 import socket
@@ -19,6 +20,9 @@ from rc2_telemetry_receiver.duml import (
     crc16,
     crc8,
 )
+from rc2_telemetry_receiver.flightrecord import parse_d7_payload
+from rc2_telemetry_receiver.flightrecord_analyze import analyze_d7_session
+from rc2_telemetry_receiver.flightlog_oracle import build_oracle_rows
 from rc2_telemetry_receiver.pcap import iter_pcap_tcp_payloads
 from rc2_telemetry_receiver.mqtt import (
     MqttConfig,
@@ -84,6 +88,136 @@ class DumlParserTest(unittest.TestCase):
         self.assertEqual("truncated_frame", results[0].reason)
 
 
+class FlightRecordParserTest(unittest.TestCase):
+    def test_d7_nested_record_is_validated_and_legacy_xor_is_retained(self) -> None:
+        sequence = 0x123456A5
+        payload = b"\x10\x20\x30\x40"
+        record = _flight_record(
+            entry_type=0x000C,
+            sequence=sequence,
+            payload=payload,
+        )
+
+        chunk = parse_d7_payload(b"\x01\x02\x00" + record)
+
+        self.assertEqual(b"\x01\x02\x00", chunk.header)
+        self.assertEqual([], list(chunk.errors))
+        self.assertEqual(1, len(chunk.records))
+        self.assertEqual(0x000C, chunk.records[0].entry_type)
+        self.assertEqual(sequence, chunk.records[0].sequence)
+        self.assertEqual(payload, chunk.records[0].legacy_xor_payload)
+
+    def test_d7_bad_nested_crc_is_rejected(self) -> None:
+        record = bytearray(_flight_record(entry_type=0x0005, sequence=7, payload=b"gps"))
+        record[-1] ^= 0xFF
+
+        chunk = parse_d7_payload(b"\x01\x02\x00" + bytes(record))
+
+        self.assertEqual([], list(chunk.records))
+        self.assertTrue(any(error.reason == "record_crc16_mismatch" for error in chunk.errors))
+
+    def test_analyzer_preserves_nested_record_order_in_artifact(self) -> None:
+        first = _flight_record(entry_type=0x0801, sequence=1, payload=bytes(16))
+        second = _flight_record(entry_type=0x03E8, sequence=2, payload=bytes(16))
+        outer = build_test_frame(
+            cmd_set=0x03,
+            cmd_id=0xD7,
+            payload=b"\x01\x02\x00" + first + second,
+        )
+        event = {
+            "type": "DUML_LAB_RESULT",
+            "request_id": "d7-test",
+            "frames": [
+                {
+                    "cmd_set": 0x03,
+                    "cmd_id": 0xD7,
+                    "raw_frame_b64": base64.b64encode(outer).decode("ascii"),
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "session.ndjson"
+            output = root / "flight-record.bin"
+            session.write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+            report = analyze_d7_session(
+                session,
+                request_id="d7-test",
+                record_output=output,
+            )
+
+            self.assertEqual(first + second, output.read_bytes())
+            self.assertEqual(2, report["nested_records"])
+            self.assertEqual({}, report["validation_errors"])
+            self.assertTrue(report["sequence_clock"]["strictly_increasing"])
+
+
+class FlightLogOracleTest(unittest.TestCase):
+    def test_oracle_downsamples_and_keeps_height_classification_explicit(self) -> None:
+        frame = {
+            "custom": {"dateTime": "2026-07-26T10:00:00Z"},
+            "osd": {
+                "flyTime": 1.1,
+                "latitude": 59.1011495,
+                "longitude": 10.3931366,
+                "height": 2.0,
+                "altitude": 9.0,
+                "pitch": 1.0,
+                "roll": 2.0,
+                "yaw": 180.0,
+                "isGpdUsed": True,
+                "gpsNum": 18,
+                "gpsLevel": 5,
+            },
+            "home": {"altitude": 7.0},
+            "gimbal": {"pitch": -90.0, "roll": 0.0, "yaw": 0.0},
+        }
+        parsed = {
+            "version": 14,
+            "details": {},
+            "summary": {"aircraftSn": "AIRCRAFT"},
+            "frames": [frame, {**frame, "osd": {**frame["osd"], "flyTime": 1.9}}],
+        }
+
+        rows = build_oracle_rows(parsed, session_id="session", interval_s=1.0)
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("candidate", rows[0]["quality"]["position"])
+        self.assertEqual("candidate", rows[0]["quality"]["height"])
+        self.assertEqual(
+            "home_plus_takeoff_relative_candidate",
+            rows[0]["quality"]["height_reference"],
+        )
+        self.assertEqual(9.0, rows[0]["position"]["altitude_candidate_msl_m"])
+        self.assertEqual(-90.0, rows[0]["gimbal"]["pitch_deg"])
+
+    def test_oracle_does_not_promote_zero_coordinates(self) -> None:
+        parsed = {
+            "version": 14,
+            "frames": [
+                {
+                    "custom": {},
+                    "osd": {
+                        "flyTime": 0.0,
+                        "latitude": 0.0,
+                        "longitude": 0.0,
+                        "isGpdUsed": False,
+                    },
+                    "home": {},
+                    "gimbal": {},
+                }
+            ],
+        }
+
+        row = build_oracle_rows(parsed, session_id="session")[0]
+
+        self.assertIsNone(row["position"]["latitude"])
+        self.assertIsNone(row["position"]["longitude"])
+        self.assertEqual("unknown", row["quality"]["position"])
+        self.assertEqual("unknown", row["quality"]["height"])
+
+
 class Publish8902ParserTest(unittest.TestCase):
     def test_split_record_extracts_clock_and_marker(self) -> None:
         raw = _publish_record(0xF5, 71, 0x1FFFE)
@@ -121,6 +255,43 @@ class Publish8902ParserTest(unittest.TestCase):
 
 
 class SessionWriterTest(unittest.TestCase):
+    def test_flight_log_chunks_reconstruct_file_by_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = SessionWriter(Path(tmp))
+            writer.handle_event(
+                {
+                    "type": "HELLO",
+                    "schema": "dji-rc2-telemetry/v2",
+                    "session_id": "flight-log",
+                    "source_mode": "dji_fly_flight_log_tail",
+                }
+            )
+            for seq, offset, data, new_file in (
+                (1, 0, b"header", True),
+                (2, 6, b"-records", False),
+                (3, 6, b"-records", False),
+            ):
+                writer.handle_event(
+                    {
+                        "type": "FLIGHT_LOG_CHUNK",
+                        "schema": "dji-rc2-telemetry/v2",
+                        "session_id": "flight-log",
+                        "seq": seq,
+                        "elapsed_realtime_ns": seq * 1_000_000,
+                        "log_name": "FlightRecord_test.txt",
+                        "offset": offset,
+                        "file_size": 14,
+                        "new_file": new_file,
+                        "bytes_b64": base64.b64encode(data).decode("ascii"),
+                        "crc32": f"{binascii.crc32(data) & 0xFFFFFFFF:08x}",
+                    }
+                )
+
+            assert writer.session_dir is not None
+            reconstructed = writer.session_dir / "flight-logs" / "FlightRecord_test.txt"
+            self.assertEqual(b"header-records", reconstructed.read_bytes())
+            self.assertEqual(14, writer.stats.flight_log_files["FlightRecord_test.txt"])
+
     def test_outbound_keepalive_is_evidence_not_inbound_stream(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             writer = SessionWriter(Path(tmp))
@@ -1313,6 +1484,21 @@ def _publish_record(marker: int, length: int, source_clock_ms: int) -> bytes:
     record[1] = 0x64
     struct.pack_into("<H", record, 2, length)
     struct.pack_into("<I", record, 4, source_clock_ms)
+    return bytes(record)
+
+
+def _flight_record(*, entry_type: int, sequence: int, payload: bytes) -> bytes:
+    length = 12 + len(payload)
+    record = bytearray(length)
+    record[0] = 0x55
+    record[1:3] = length.to_bytes(2, "little")
+    record[3] = crc8(bytes(record[:3]))
+    record[4:6] = entry_type.to_bytes(2, "little")
+    record[6:10] = sequence.to_bytes(4, "little")
+    xor_key = sequence & 0xFF
+    record[10:-2] = bytes(byte ^ xor_key for byte in payload)
+    checksum = crc16(bytes(record[:-2]))
+    record[-2:] = checksum.to_bytes(2, "little")
     return bytes(record)
 
 

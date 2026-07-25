@@ -146,6 +146,44 @@ class TelemetryEventsTest {
     }
 
     @Test
+    fun `hello records read only DJI Fly flight log policy`() {
+        val line = TelemetryHelloEvent(
+            sessionId = "session-log",
+            config = TelemetryConfig(
+                host = "192.168.5.99",
+                port = 8765,
+                sourceId = "neo2",
+                capturePort = FLIGHT_LOG_SOURCE_PORT
+            ),
+            appVersion = "test",
+            controllerModel = "rc331"
+        ).toJsonLine()
+
+        assertTrue(line.contains("\"source_mode\":\"dji_fly_flight_log_tail\""))
+        assertTrue(line.contains("\"source_port\":-1"))
+        assertTrue(line.contains("\"source_policy\":\"read_only_growing_file_offset_chunks\""))
+    }
+
+    @Test
+    fun `flight log chunk preserves file offset and bytes`() {
+        val line = FlightLogChunkEvent(
+            sessionId = "session-log",
+            seq = 3,
+            elapsedRealtimeNs = 9,
+            logName = "FlightRecord_test.txt",
+            offset = 1024,
+            fileSize = 1030,
+            newFile = false,
+            bytes = byteArrayOf(1, 2, 3)
+        ).toJsonLine()
+
+        assertTrue(line.contains("\"type\":\"FLIGHT_LOG_CHUNK\""))
+        assertTrue(line.contains("\"offset\":1024"))
+        assertTrue(line.contains("\"file_size\":1030"))
+        assertTrue(line.contains("\"bytes_b64\":\"AQID\""))
+    }
+
+    @Test
     fun `snapshot stats preserve command and connection evidence`() {
         val line = SnapshotStatsEvent(
             sessionId = "session-4",

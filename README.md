@@ -185,7 +185,14 @@ Each command is a small binary packet with a magic byte (`0x55`), a header with 
 
 This fork adds a separate Telemetry tab for raw metadata research. It can stream `RAW_CHUNK` and validated `DUML_FRAME` NDJSON records to a local Mac on port `8765`.
 
-`1.5.3-research.13` defaults to the read-only RC2 publish endpoint
+`1.5.3-research.14` adds a preferred read-only DJI Fly flight-log source.
+`Flight Log Tail` follows
+`/storage/emulated/0/Android/data/dji.go.v5/files/FlightRecord`, emits
+offset-addressed `FLIGHT_LOG_CHUNK` records, and opens no DJI controller
+socket. The Mac receiver reconstructs each file byte-for-byte before optional
+v14 keychain decoding.
+
+The previous default source is the read-only RC2 publish endpoint
 `127.0.0.1:8902`. One socket remains open for the explicit session, the app
 sends no bytes to that endpoint, and a `TELEMETRY_TICK` produces one Mac-side
 `GEOREFERENCE_SAMPLE` per second. A connected but silent endpoint is reported
@@ -321,7 +328,9 @@ accepted a LAN connection but stayed byte-silent in foreground, DJI Fly and
 handoff tests. `research.12` therefore introduced `Lab only` as the
 non-invasive runtime and the Accessibility UI snapshot stream for live label
 discovery. `research.13` adds direct access to the RC2's otherwise hidden
-Accessibility panel.
+Accessibility panel. `research.14` adds the DJI Fly flight-log tail after MTP
+confirmed the log directory and a partially written v14 log decoded 92
+complete frames while safely rejecting its truncated final record.
 
 The Mac receiver now emits one field-freshness-controlled
 `GEOREFERENCE_SAMPLE` per second. AMSL from candidate `03/57` and takeoff
@@ -344,7 +353,7 @@ and periodic `07/19`/`07/30` country traffic does not improve metadata capture.
 The structured RM510 `51/14` layout is the relevant change adopted in this
 release.
 
-Current research build: `1.5.3-research.13`. It remains bench-only until its
+Current research build: `1.5.3-research.14`. It remains bench-only until its
 physical RC2 gate has passed. See
 [`docs/TELEMETRY_ARCHITECTURE.md`](docs/TELEMETRY_ARCHITECTURE.md) for the
 transport boundary and acceptance gates.
