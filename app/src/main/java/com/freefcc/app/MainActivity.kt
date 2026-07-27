@@ -1,11 +1,16 @@
 package com.freefcc.app
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.provider.DocumentsContract
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
@@ -36,6 +41,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.launch
 import kotlin.math.sin
 import kotlin.math.PI
@@ -66,9 +72,42 @@ private val BottomNavHeight = 72.dp
 class MainActivity : ComponentActivity() {
 
     private val viewModel: FccViewModel by viewModels()
+    private val notificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private val storagePermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private val flightLogFolderPicker =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            if (uri != null) {
+                runCatching {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                }.onSuccess {
+                    viewModel.setTelemetryFlightLogTreeUri(uri.toString())
+                }.onFailure {
+                    viewModel.setTelemetryFlightLogTreeUri("")
+                }
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (
+            Build.VERSION.SDK_INT <= Build.VERSION_CODES.S_V2 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            storagePermission.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
         viewModel.init()
 
         setContent {
@@ -80,9 +119,19 @@ class MainActivity : ComponentActivity() {
                     error = Red, secondary = Green, tertiary = Amber
                 )
             ) {
-                AppRoot(viewModel)
+                AppRoot(
+                    viewModel = viewModel,
+                    onPickFlightLogFolder = {
+                        flightLogFolderPicker.launch(FLIGHT_LOG_INITIAL_URI)
+                    }
+                )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.refreshDjiFlyAccessibilityStatus()
     }
 }
 
@@ -91,9 +140,12 @@ class MainActivity : ComponentActivity() {
 // ═══════════════════════════════════════════════════════════════════════
 
 @Composable
-private fun AppRoot(viewModel: FccViewModel) {
+private fun AppRoot(
+    viewModel: FccViewModel,
+    onPickFlightLogFolder: () -> Unit
+) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    val pagerState = rememberPagerState(initialPage = 0) { 5 }
+    val pagerState = rememberPagerState(initialPage = 0) { 6 }
     val scope = rememberCoroutineScope()
 
     val entrance = remember { Animatable(0f) }
@@ -101,7 +153,7 @@ private fun AppRoot(viewModel: FccViewModel) {
         entrance.animateTo(1f, tween(700, easing = EaseOutCubic))
     }
 
-    BoxWithConstraints(
+    Box(
         modifier = Modifier
             .fillMaxSize()
             .background(
@@ -137,9 +189,10 @@ private fun AppRoot(viewModel: FccViewModel) {
             when (page) {
                 0 -> FccPage(state, viewModel)
                 1 -> InfoPage(state, viewModel)
-                2 -> LogPage(state)
-                3 -> UpdatePage(state, viewModel)
-                4 -> SupportPage()
+                2 -> TelemetryPage(state, viewModel, onPickFlightLogFolder)
+                3 -> LogPage(state)
+                4 -> UpdatePage(state, viewModel)
+                5 -> SupportPage()
             }
         }
 
@@ -153,6 +206,342 @@ private fun AppRoot(viewModel: FccViewModel) {
         )
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Page 3: Telemetry research
+// ═══════════════════════════════════════════════════════════════════════
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TelemetryPage(
+    state: AppState,
+    viewModel: FccViewModel,
+    onPickFlightLogFolder: () -> Unit
+) {
+    val runtime = state.telemetryRuntime
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp)
+            .padding(bottom = BottomNavHeight + 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Spacer(Modifier.height(56.dp))
+        PageTitle("Telemetry", Icons.Filled.Code)
+        Spacer(Modifier.height(28.dp))
+
+        GlowCard {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                StatusDot(
+                    when {
+                        runtime.running && runtime.relayConnected && runtime.captureActive -> Green
+                        runtime.running && runtime.relayConnected &&
+                            runtime.sourceMode == "duml_lab_control_only" -> Green
+                        runtime.running && runtime.relayConnected -> Amber
+                        runtime.running || runtime.connecting -> Amber
+                        runtime.lastError.isNotEmpty() -> Red
+                        else -> TextDim
+                    }
+                )
+                Spacer(Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        when {
+                            runtime.running && runtime.relayConnected &&
+                                runtime.sourceStatus == "active" -> "Streaming fresh metadata"
+                            runtime.running && runtime.relayConnected &&
+                                runtime.sourceMode == "duml_lab_control_only" -> "DUML Lab ready"
+                            runtime.running && runtime.relayConnected &&
+                                runtime.sourceStatus == "unavailable" -> "Relay connected; metadata unavailable"
+                            runtime.running && runtime.relayConnected &&
+                                runtime.captureActive -> "Relay connected; source waiting"
+                            runtime.running && runtime.relayConnected -> "Relay connected; capture stopped"
+                            runtime.running || runtime.connecting -> "Starting relay"
+                            runtime.lastError.isNotEmpty() -> "Stopped fail-closed"
+                            else -> "Stopped"
+                        },
+                        color = TextWhite,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "${runtime.sourceMode.ifBlank { "rc2_publish_8902" }}:${runtime.sourcePort}",
+                        color = Amber,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+            BodyText(
+                if (runtime.sourceMode == "duml_lab_control_only") {
+                    "Mac-controlled bounded DUML recipes; no controller capture port is held."
+                } else if (runtime.sourceMode == "dji_fly_flight_log_tail") {
+                    "Read-only tail of DJI Fly FlightRecord; no DUML socket is opened."
+                } else if (runtime.sourceMode == "bench_wrapped_snapshot_1hz") {
+                    "One wrapped 00/01 command per short-lived 40007 connection, paced at 1 Hz."
+                } else {
+                    "One explicit passive source connection; source gaps make metadata unavailable."
+                },
+                Amber
+            )
+
+            if (runtime.sessionId.isNotEmpty()) {
+                Spacer(Modifier.height(16.dp))
+                InfoRow("Session", runtime.sessionId.take(8), Cyan)
+            }
+            if (runtime.lastError.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                BodyText(runtime.lastError, Red)
+            }
+            Spacer(Modifier.height(12.dp))
+            InfoRow(
+                "Source",
+                runtime.sourceStatus.uppercase(),
+                when (runtime.sourceStatus) {
+                    "active" -> Green
+                    "unavailable" -> Red
+                    else -> Amber
+                }
+            )
+            Spacer(Modifier.height(8.dp))
+            InfoRow("Snapshots", runtime.snapshots.toString(), TextWhite)
+            Spacer(Modifier.height(8.dp))
+            InfoRow("Records", runtime.records.toString(), TextWhite)
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        GlowCard {
+            Text("Mac relay", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(14.dp))
+            ResearchTextField(
+                value = state.telemetryHost,
+                onValueChange = viewModel::updateTelemetryHost,
+                label = "Mac IP",
+                placeholder = "192.168.1.20",
+                enabled = !runtime.running
+            )
+            Spacer(Modifier.height(10.dp))
+            ResearchTextField(
+                value = state.telemetryPort,
+                onValueChange = viewModel::updateTelemetryPort,
+                label = "Port",
+                placeholder = "8765",
+                enabled = !runtime.running
+            )
+            Spacer(Modifier.height(10.dp))
+            ResearchTextField(
+                value = state.telemetrySourceId,
+                onValueChange = viewModel::updateTelemetrySourceId,
+                label = "Source ID",
+                placeholder = "rc2-bench",
+                enabled = !runtime.running
+            )
+            Spacer(Modifier.height(14.dp))
+            Text("Metadata source", color = TextGray, fontSize = 12.sp)
+            Spacer(Modifier.height(8.dp))
+            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                listOf(
+                    Triple("Log", FLIGHT_LOG_SOURCE_PORT, false),
+                    Triple("Lab", CONTROL_ONLY_PORT, false),
+                    Triple("8902", 8902, false),
+                    Triple("40007 1Hz", 40007, true)
+                ).forEachIndexed { index, choice ->
+                    SegmentedButton(
+                        selected = state.telemetryCapturePort == choice.second.toString() &&
+                            state.telemetryStreamKeepaliveEnabled == choice.third,
+                        onClick = { viewModel.selectTelemetrySource(choice.second, choice.third) },
+                        shape = SegmentedButtonDefaults.itemShape(index, 4),
+                        enabled = !runtime.running
+                    ) {
+                        Text(choice.first, fontSize = 10.sp)
+                    }
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            ResearchTextField(
+                value = state.telemetryCapturePort,
+                onValueChange = viewModel::updateTelemetryCapturePort,
+                label = "Custom research port",
+                placeholder = "8902",
+                enabled = !runtime.running
+            )
+            Spacer(Modifier.height(8.dp))
+            BodyText(
+                if (state.telemetryCapturePort == CONTROL_ONLY_PORT.toString()) {
+                    "CONTROL ONLY: DJI ports stay free; visible DJI Fly labels relay through Accessibility."
+                } else if (state.telemetryCapturePort == FLIGHT_LOG_SOURCE_PORT.toString()) {
+                    if (state.telemetryFlightLogTreeUri.isNotBlank()) {
+                        "READ ONLY: SAF live access selected for DJI Fly FlightRecord."
+                    } else {
+                        "DELAYED: public Download mirror is copied after DJI Fly flushes the log."
+                    }
+                } else if (state.telemetryStreamKeepaliveEnabled) {
+                    "ACTIVE BENCH: one wrapped 00/01 per short-lived connection, paced at 1 Hz."
+                } else {
+                    "Passive source; no writes or automatic reconnect."
+                },
+                if (state.telemetryStreamKeepaliveEnabled) Amber else TextDim
+            )
+            if (state.telemetryCapturePort == FLIGHT_LOG_SOURCE_PORT.toString()) {
+                Spacer(Modifier.height(12.dp))
+                InfoRow(
+                    "Live log access",
+                    if (state.telemetryFlightLogTreeUri.isBlank()) "NOT SELECTED" else "SAF GRANTED",
+                    if (state.telemetryFlightLogTreeUri.isBlank()) Amber else Green
+                )
+                Spacer(Modifier.height(12.dp))
+                GlowButton(
+                    "Select FlightRecord folder",
+                    Cyan,
+                    filled = false,
+                    enabled = !runtime.running
+                ) { onPickFlightLogFolder() }
+            }
+            Spacer(Modifier.height(14.dp))
+            InfoRow(
+                "DJI Fly UI access",
+                if (state.isDjiFlyAccessibilityEnabled) "ENABLED" else "REQUIRED",
+                if (state.isDjiFlyAccessibilityEnabled) Green else Amber
+            )
+            if (!state.isDjiFlyAccessibilityEnabled) {
+                Spacer(Modifier.height(12.dp))
+                GlowButton(
+                    "Open Accessibility",
+                    Amber,
+                    filled = false
+                ) { viewModel.openDjiFlyAccessibilitySettings() }
+            }
+            Spacer(Modifier.height(18.dp))
+            if (runtime.running) {
+                GlowButton("Stop Relay", Red) { viewModel.stopTelemetryRelay() }
+            } else {
+                GlowButton("Start Relay", Cyan, enabled = !state.isHardwareBusy) { viewModel.startTelemetryRelay() }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        GlowCard {
+            Text("Session metadata", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(14.dp))
+            ResearchTextField(
+                value = state.telemetryControllerFirmware,
+                onValueChange = viewModel::updateTelemetryControllerFirmware,
+                label = "RC firmware",
+                placeholder = "record before test",
+                enabled = !runtime.running
+            )
+            Spacer(Modifier.height(10.dp))
+            ResearchTextField(
+                value = state.telemetryDjiFlyVersion,
+                onValueChange = viewModel::updateTelemetryDjiFlyVersion,
+                label = "DJI Fly",
+                placeholder = "v1.xx.x",
+                enabled = !runtime.running
+            )
+            Spacer(Modifier.height(10.dp))
+            ResearchTextField(
+                value = state.telemetryAircraftModel,
+                onValueChange = viewModel::updateTelemetryAircraftModel,
+                label = "Aircraft",
+                placeholder = "Air 3S / Mini / ...",
+                enabled = !runtime.running
+            )
+            Spacer(Modifier.height(10.dp))
+            ResearchTextField(
+                value = state.telemetryAircraftFirmware,
+                onValueChange = viewModel::updateTelemetryAircraftFirmware,
+                label = "Aircraft firmware",
+                placeholder = "record before test",
+                enabled = !runtime.running
+            )
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        GlowCard {
+            Text("DUML Lab", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(10.dp))
+            BodyText(
+                "Mac-local control can run bounded direct, wrapped or raw recipes on any localhost port. A port held by capture is rejected.",
+                Amber
+            )
+            Spacer(Modifier.height(14.dp))
+            GlowButton(
+                text = if (state.telemetryProbeBusy) "Probing..." else "Probe GPS / attitude",
+                color = Amber,
+                enabled = !state.telemetryProbeBusy && !state.isHardwareBusy
+            ) { viewModel.probeTelemetryFcOsd() }
+
+            if (state.telemetryProbeMessage.isNotEmpty()) {
+                Spacer(Modifier.height(14.dp))
+                BodyText(state.telemetryProbeMessage, if (state.telemetryProbeResult != null) Green else TextGray)
+            }
+
+            state.telemetryProbeResult?.let { result ->
+                Spacer(Modifier.height(14.dp))
+                DividerLine()
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Quality", "CANDIDATE / UNVERIFIED", Amber)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Payload", "${result.payloadSize} bytes", TextWhite)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Longitude raw", candidateNumber(result.longitudeRaw, 9), TextGray)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Latitude raw", candidateNumber(result.latitudeRaw, 9), TextGray)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Longitude deg?", candidateNumber(result.longitudeRadiansCandidateDeg, 6), Cyan)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Latitude deg?", candidateNumber(result.latitudeRadiansCandidateDeg, 6), Cyan)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Relative height?", "${candidateNumber(result.relativeHeightCandidateM, 1)} m", Cyan)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Aircraft pitch?", "${candidateNumber(result.pitchCandidateDeg, 1)} deg", Green)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Aircraft roll?", "${candidateNumber(result.rollCandidateDeg, 1)} deg", Green)
+                Spacer(Modifier.height(10.dp))
+                InfoRow("Aircraft yaw?", "${candidateNumber(result.yawCandidateDeg, 1)} deg", Green)
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        GlowCard {
+            Text("Counters", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(12.dp))
+            InfoRow("Raw chunks", runtime.rawChunks.toString(), Cyan)
+            Spacer(Modifier.height(10.dp))
+            DividerLine()
+            Spacer(Modifier.height(10.dp))
+            InfoRow("DUML frames", runtime.frames.toString(), Green)
+            Spacer(Modifier.height(10.dp))
+            DividerLine()
+            Spacer(Modifier.height(10.dp))
+            InfoRow("Parser errors", runtime.parserErrors.toString(), if (runtime.parserErrors == 0L) TextGray else Amber)
+            Spacer(Modifier.height(10.dp))
+            DividerLine()
+            Spacer(Modifier.height(10.dp))
+            InfoRow("Bytes", runtime.bytes.toString(), TextWhite)
+            Spacer(Modifier.height(10.dp))
+            DividerLine()
+            Spacer(Modifier.height(10.dp))
+            InfoRow("Queue", runtime.queueDepth.toString(), if (runtime.queueDepth < 400) TextGray else Amber)
+        }
+    }
+}
+
+private val FLIGHT_LOG_INITIAL_URI: Uri = DocumentsContract.buildDocumentUri(
+    "com.android.externalstorage.documents",
+    "primary:Android/data/dji.go.v5/files/FlightRecord"
+)
+
+private fun candidateNumber(value: Double?, decimals: Int): String =
+    value?.let { String.format(java.util.Locale.US, "%.${decimals}f", it) } ?: "unknown"
 
 // ═══════════════════════════════════════════════════════════════════════
 // Page 1: FCC
@@ -239,7 +628,7 @@ private fun FccPage(state: AppState, viewModel: FccViewModel) {
                             Text("Keepalive", color = TextWhite, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                             Spacer(Modifier.height(2.dp))
                             Text(
-                                if (state.isKeepaliveRunning) "Re-applying FCC every 2s to prevent CE reset"
+                                if (state.isKeepaliveRunning) "Armed for DJI Fly Home Point"
                                 else "Keep FCC active while DJI Fly runs",
                                 color = if (state.isKeepaliveRunning) Green else TextGray,
                                 fontSize = 11.sp,
@@ -399,7 +788,7 @@ private fun FccPage(state: AppState, viewModel: FccViewModel) {
                     Text("Auto-FCC", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "Auto-connect, apply FCC, start keepalive, and launch DJI Fly.",
+                        "Waits for DJI Fly Home Point, then applies FCC once. No DUML polling while armed.",
                         color = TextGray,
                         fontSize = 12.sp,
                         lineHeight = 17.sp
@@ -444,8 +833,8 @@ private fun InfoPage(state: AppState, viewModel: FccViewModel) {
             DividerLine()
             Spacer(Modifier.height(10.dp))
             InfoRow(
-                "Status",
-                if (state.isConnected) "Connected" else "Disconnected",
+                "DUML check",
+                if (state.isConnected) "Ready" else "Not checked",
                 valueColor = if (state.isConnected) Green else TextGray
             )
             Spacer(Modifier.height(10.dp))
@@ -586,8 +975,55 @@ private fun UpdatePage(state: AppState, viewModel: FccViewModel) {
         Spacer(Modifier.height(56.dp))
         PageTitle("Updates", Icons.Outlined.SystemUpdate)
 
+        Spacer(Modifier.height(20.dp))
+        GlowCard {
+            Text("Release channel", color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(12.dp))
+            ResearchTextField(
+                value = state.updateEndpoint,
+                onValueChange = viewModel::updateReleaseEndpoint,
+                label = "Manifest or GitHub API URL",
+                placeholder = UpdateChecker.DEFAULT_API_URL,
+                enabled = !state.isCheckingUpdate && !state.isDownloadingUpdate
+            )
+            Spacer(Modifier.height(14.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Button(
+                    onClick = { viewModel.resetReleaseEndpoint() },
+                    enabled = !state.isCheckingUpdate && !state.isDownloadingUpdate,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.Transparent,
+                        contentColor = TextGray,
+                        disabledContainerColor = TextGray.copy(0.1f),
+                        disabledContentColor = TextGray.copy(0.3f)
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, CardBorder),
+                    modifier = Modifier.weight(1f).height(46.dp)
+                ) {
+                    Text("Reset", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                }
+                Button(
+                    onClick = { viewModel.checkForUpdates(force = true) },
+                    enabled = !state.isCheckingUpdate && !state.isDownloadingUpdate,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Cyan,
+                        contentColor = BgDark,
+                        disabledContainerColor = Cyan.copy(0.2f),
+                        disabledContentColor = Cyan.copy(0.4f)
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.weight(1f).height(46.dp)
+                ) {
+                    Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Check", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                }
+            }
+        }
+
         if (state.isCheckingUpdate) {
-            Spacer(Modifier.height(28.dp))
+            Spacer(Modifier.height(16.dp))
             GlowCard {
                 Column(
                     Modifier.fillMaxWidth(),
@@ -603,7 +1039,7 @@ private fun UpdatePage(state: AppState, viewModel: FccViewModel) {
 
         val info = state.updateInfo
         if (info == null && state.updateChecked) {
-            Spacer(Modifier.height(28.dp))
+            Spacer(Modifier.height(16.dp))
             GlowCard {
                 Column(
                     Modifier.fillMaxWidth(),
@@ -626,7 +1062,7 @@ private fun UpdatePage(state: AppState, viewModel: FccViewModel) {
 
         if (info == null) return@Column
 
-        Spacer(Modifier.height(28.dp))
+        Spacer(Modifier.height(16.dp))
 
         GlowCard {
             Row(
@@ -665,6 +1101,17 @@ private fun UpdatePage(state: AppState, viewModel: FccViewModel) {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text("Latest:", color = TextGray, fontSize = 13.sp)
                     Text("v${info.version}", color = Green, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+                Spacer(Modifier.height(10.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("Source:", color = TextGray, fontSize = 13.sp)
+                    Text(
+                        info.source.take(32),
+                        color = TextWhite,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        maxLines = 1
+                    )
                 }
                 Spacer(Modifier.height(10.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -950,23 +1397,27 @@ private fun PageTitle(title: String, icon: androidx.compose.ui.graphics.vector.I
 @Composable
 private fun ConnectionPill(state: AppState) {
     val (label, color) = when {
-        state.status == "connecting" -> "Connecting..." to Amber
-        state.isConnected -> "Connected" to Green
+        state.status == "connecting" -> "Checking DUML..." to Amber
+        state.isConnected -> "DUML ready" to Green
+        state.telemetryRuntime.running && state.telemetryRuntime.relayConnected ->
+            "Relay active" to Cyan
         state.status == "error" -> "Error" to Red
-        else -> "Disconnected" to TextGray
+        else -> "DUML not checked" to TextGray
     }
 
     // Bounce-in on state change (no scale overflow — use alpha + small bump)
     val bounce = remember { Animatable(1f) }
-    LaunchedEffect(state.isConnected) {
-        if (state.isConnected) {
+    val active = state.isConnected ||
+        (state.telemetryRuntime.running && state.telemetryRuntime.relayConnected)
+    LaunchedEffect(active) {
+        if (active) {
             bounce.snapTo(0.8f)
             bounce.animateTo(1f, spring(dampingRatio = Spring.DampingRatioMediumBouncy))
         }
     }
 
     // Pulsing glow when connected
-    val glowAlpha: Float = if (state.isConnected) {
+    val glowAlpha: Float = if (active) {
         val t = rememberInfiniteTransition(label = "pill")
         val a by t.animateFloat(0.1f, 0.25f, infiniteRepeatable(tween(1800), RepeatMode.Reverse), label = "pillGlow")
         a
@@ -1103,6 +1554,36 @@ private fun BodyText(text: String, color: Color = TextGray) {
         color = color,
         fontSize = 13.sp,
         lineHeight = 20.sp
+    )
+}
+
+@Composable
+private fun ResearchTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    placeholder: String,
+    enabled: Boolean
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        enabled = enabled,
+        label = { Text(label) },
+        placeholder = { Text(placeholder) },
+        singleLine = true,
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = Cyan,
+            unfocusedBorderColor = CardBorder,
+            focusedLabelColor = Cyan,
+            unfocusedLabelColor = TextGray,
+            focusedTextColor = TextWhite,
+            unfocusedTextColor = TextWhite,
+            disabledTextColor = TextGray,
+            disabledBorderColor = CardBorder.copy(0.5f),
+            cursorColor = Cyan
+        ),
+        modifier = Modifier.fillMaxWidth()
     )
 }
 
@@ -1259,6 +1740,7 @@ private fun BottomNavBar(
     val tabs = listOf(
         Triple("FCC", Icons.Filled.Wifi, Cyan),
         Triple("Info", Icons.Filled.Info, Green),
+        Triple("Relay", Icons.Filled.Code, Cyan),
         Triple("Log", Icons.Filled.History, Amber),
         Triple("Update", Icons.Filled.SystemUpdate, Color(0xFFB39DDB)),
         Triple("Support", Icons.Filled.Favorite, Red)

@@ -5,7 +5,7 @@ import android.content.Context
 import android.content.Intent
 
 /**
- * Restarts the FCC keepalive service after a reboot if the user enabled auto-FCC.
+ * Re-arms event-driven Auto FCC after a reboot if the user enabled it.
  *
  * The auto-FCC preference is stored in SharedPreferences and survives a reboot,
  * but Android kills all app processes on reboot — so the keepalive foreground

@@ -1,0 +1,30 @@
+{
+  "schema": "duml-lab/v1",
+  "name": "40007 passive short observation",
+  "port": 40007,
+  "connect_timeout_ms": 2000,
+  "total_timeout_ms": 5000,
+  "max_rx_bytes": 262144,
+  "setup": [
+    {
+      "op": "connect",
+      "label": "open passive wrapped socket"
+    }
+  ],
+  "cycle": [
+    {
+      "op": "read",
+      "label": "observe without writes",
+      "duration_ms": 2500,
+      "idle_timeout_ms": 1000,
+      "max_bytes": 65536
+    }
+  ],
+  "cycle_count": 1,
+  "teardown": [
+    {
+      "op": "close",
+      "label": "explicit close"
+    }
+  ]
+}

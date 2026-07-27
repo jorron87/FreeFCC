@@ -7,7 +7,7 @@ import org.junit.Test
 /**
  * Covers DumlBuilder.validateResponse() against the checklist Codex required in
  * plan review: valid response, CRC-8, CRC-16, length, sequence, routing, command
- * set/ID, and the response bit — each isolated so only that one check fails.
+ * set/ID. The response bit is intentionally advisory because DJI replies often omit it.
  *
  * Wire layout: [4] sender, [5] dst, [6-7] seq, [8] cmdType, [9] cmdSet, [10] cmdId
  * A response reverses [4]<->[5] (sender<->receiver) and sets bit 7 of [8].
@@ -90,6 +90,10 @@ class DumlResponseValidationTest {
             payload = byteArrayOf(9, 8, 7, 6)
         )
         assertNull(DumlBuilder.validateResponse(request, response))
+        org.junit.Assert.assertEquals(
+            "sequence_mismatch",
+            DumlBuilder.inspectResponse(request, response).status
+        )
     }
 
     @Test
@@ -123,12 +127,17 @@ class DumlResponseValidationTest {
     }
 
     @Test
-    fun `missing response bit is rejected`() {
+    fun `missing response bit is accepted when correlation fields match`() {
+        val payload = byteArrayOf(9, 8, 7, 6)
         val response = buildRawFrame(
             sender = 0x28, dst = 0x01, seq = 1234,
-            cmdType = 0x00, cmdSet = 0x02, cmdId = 0x03, // response bit not set
-            payload = byteArrayOf(9, 8, 7, 6)
+            cmdType = 0x00, cmdSet = 0x02, cmdId = 0x03,
+            payload = payload
         )
-        assertNull(DumlBuilder.validateResponse(request, response))
+        assertArrayEquals(payload, DumlBuilder.validateResponse(request, response))
+        org.junit.Assert.assertEquals(
+            "matched",
+            DumlBuilder.inspectResponse(request, response).status
+        )
     }
 }

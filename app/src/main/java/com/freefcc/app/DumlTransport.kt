@@ -5,6 +5,7 @@ import android.net.LocalSocketAddress
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -29,6 +30,22 @@ data class DumlFrame(
     val cmdId: Int,
     val dst: Int,
     val payload: ByteArray
+)
+
+data class DumlResponseObservation(
+    val raw: ByteArray,
+    val validation: String
+)
+
+data class DumlExchangeResult(
+    val payload: ByteArray? = null,
+    val terminalReason: String,
+    val observations: List<DumlResponseObservation> = emptyList()
+)
+
+data class DumlResponseValidation(
+    val status: String,
+    val payload: ByteArray? = null
 )
 
 /**
@@ -156,44 +173,53 @@ class DumlBuilder {
          *
          * Checks magic, encoded length (must exactly match the byte count received —
          * catches truncated/appended reads), header CRC-8, full-frame CRC-16, the
-         * response bit in cmdType, matching sequence number, reversed sender/receiver
-         * routing, and matching command set/ID. Pure function, no I/O — every check
+         * matching sequence number, reversed sender/receiver routing, and matching
+         * command set/ID. The response bit is deliberately not required because DJI
+         * devices commonly omit it on otherwise valid replies. Pure function, no I/O — every check
          * runs against the two byte arrays given.
          *
          * Wire layout used here:
          *   [4] sender, [5] dst, [6-7] seq, [8] cmdType, [9] cmdSet, [10] cmdId
-         * A response echoes [4]<->[5] (sender<->receiver reversed) and sets
-         * bit 7 of [8] (cmdType response flag).
+         * A response echoes [4]<->[5] (sender<->receiver reversed). Bit 7 of
+         * [8] is advisory only and is not reliable across DJI components.
          *
          * @return the response payload on success, or null on any mismatch
          */
-        fun validateResponse(request: ByteArray, response: ByteArray): ByteArray? {
-            if (response.size < 13) return null
-            if (response[0] != 0x55.toByte()) return null
+        fun validateResponse(request: ByteArray, response: ByteArray): ByteArray? =
+            inspectResponse(request, response).payload
+
+        fun inspectResponse(request: ByteArray, response: ByteArray): DumlResponseValidation {
+            if (response.size < 13) return DumlResponseValidation("frame_too_short")
+            if (response[0] != 0x55.toByte()) return DumlResponseValidation("bad_magic")
 
             val totalLength = (response[1].toInt() and 0xFF) or ((response[2].toInt() and 0x03) shl 8)
-            if (totalLength < 13 || totalLength > 1023) return null
-            if (totalLength != response.size) return null
+            if (totalLength < 13 || totalLength > 1023) return DumlResponseValidation("invalid_length")
+            if (totalLength != response.size) return DumlResponseValidation("length_mismatch")
 
-            if (crc8(response, 0, 3) != (response[3].toInt() and 0xFF)) return null
+            if (crc8(response, 0, 3) != (response[3].toInt() and 0xFF)) {
+                return DumlResponseValidation("crc8_mismatch")
+            }
 
             val expectedCrc16 = crc16(response, 0, totalLength - 2)
             val actualCrc16 = (response[totalLength - 2].toInt() and 0xFF) or
                 ((response[totalLength - 1].toInt() and 0xFF) shl 8)
-            if (expectedCrc16 != actualCrc16) return null
+            if (expectedCrc16 != actualCrc16) return DumlResponseValidation("crc16_mismatch")
 
-            if (request.size < 11) return null
+            if (request.size < 11) return DumlResponseValidation("request_too_short")
 
-            val cmdType = response[8].toInt() and 0xFF
-            if ((cmdType and 0x80) == 0) return null // response bit not set
-
-            if (response[6] != request[6] || response[7] != request[7]) return null // sequence
-            if (response[4] != request[5] || response[5] != request[4]) return null // reversed routing
-            if (response[9] != request[9] || response[10] != request[10]) return null // cmd set/id
+            if (response[6] != request[6] || response[7] != request[7]) {
+                return DumlResponseValidation("sequence_mismatch")
+            }
+            if (response[4] != request[5] || response[5] != request[4]) {
+                return DumlResponseValidation("routing_mismatch")
+            }
+            if (response[9] != request[9] || response[10] != request[10]) {
+                return DumlResponseValidation("command_mismatch")
+            }
 
             val payloadLength = totalLength - 13
-            if (payloadLength <= 0) return ByteArray(0)
-            return response.copyOfRange(11, 11 + payloadLength)
+            val payload = if (payloadLength <= 0) ByteArray(0) else response.copyOfRange(11, 11 + payloadLength)
+            return DumlResponseValidation("matched", payload)
         }
     }
 }
@@ -251,11 +277,12 @@ class DumlTransport {
         interRoundDelayMs: Long = 0,
         readWindowMs: Int = 80,
         port: Int = PORT,
+        pinPort: Boolean = false,
         onProgress: (Float) -> Unit = {}
     ): Boolean {
         // If port is the default (40009), scan for the actual working port.
         // If port is explicitly set (e.g. 40007 for LED), use it directly.
-        val effectivePort = if (port == PORT) findWorkingPort() else port
+        val effectivePort = if (!pinPort && port == PORT) findWorkingPort() else port
 
         var anySuccess = false
         val totalSends = frames.size * rounds
@@ -287,38 +314,72 @@ class DumlTransport {
      * @return response payload, or null if no response was received
      */
     fun sendAndReceive(frame: ByteArray, readWindowMs: Int = 500, port: Int = PORT): ByteArray? {
+        return sendAndReceiveDetailed(frame, readWindowMs, port).payload
+    }
+
+    /**
+     * Sends one frame and retains a bounded diagnostic sample of complete DUML
+     * frames observed before a match, EOF or timeout.
+     */
+    fun sendAndReceiveDetailed(
+        frame: ByteArray,
+        readWindowMs: Int = 500,
+        port: Int = PORT,
+        pinPort: Boolean = false
+    ): DumlExchangeResult {
         var socket: Socket? = null
+        val observations = mutableListOf<DumlResponseObservation>()
         try {
-            val effectivePort = if (port == PORT) findWorkingPort() else port
+            val effectivePort = if (!pinPort && port == PORT) findWorkingPort() else port
             socket = Socket()
             socket.connect(InetSocketAddress(HOST, effectivePort), CONNECT_TIMEOUT_MS)
             socket.tcpNoDelay = true
-            socket.soTimeout = readWindowMs
 
             socket.getOutputStream().apply { write(frame); flush() }
 
             val input = socket.getInputStream()
-            val header = readBytes(input, 11) ?: return null
+            val deadlineNs = System.nanoTime() + readWindowMs.coerceAtLeast(1) * 1_000_000L
+            while (true) {
+                val remainingNs = deadlineNs - System.nanoTime()
+                if (remainingNs <= 0) {
+                    return DumlExchangeResult(
+                        terminalReason = "timeout",
+                        observations = observations
+                    )
+                }
+                socket.soTimeout = ((remainingNs + 999_999L) / 1_000_000L)
+                    .coerceIn(1L, Int.MAX_VALUE.toLong())
+                    .toInt()
 
-            // Guard against a short read returning fewer than 3 bytes —
-            // indexing header[0..2] for magic/length would otherwise throw.
-            if (header.size < 3) return null
+                val response = readDumlFrame(input) ?: return DumlExchangeResult(
+                    terminalReason = "eof_or_invalid_frame",
+                    observations = observations
+                )
+                val validation = DumlBuilder.inspectResponse(frame, response)
+                if (observations.size < MAX_RESPONSE_OBSERVATIONS) {
+                    observations += DumlResponseObservation(response, validation.status)
+                }
+                if (validation.payload != null) {
+                    return DumlExchangeResult(
+                        payload = validation.payload,
+                        terminalReason = "matched",
+                        observations = observations
+                    )
+                }
+                // The proxy can interleave unsolicited telemetry. Keep reading
+                // until the bounded deadline for the response matching this request.
+            }
 
-            // Verify magic byte before trusting the encoded length enough to read more
-            if (header[0] != 0x55.toByte()) return null
-
-            // Extract total length from bytes 1-2 (11-bit LE) to know how much more to read
-            val totalLength = (header[1].toInt() and 0xFF) or ((header[2].toInt() and 0x03) shl 8)
-            if (totalLength < 13 || totalLength > 1023) return null
-
-            // Read the rest (payload + 2 CRC bytes)
-            val remaining = readBytes(input, totalLength - 11) ?: return null
-            val response = header + remaining
-
-            return DumlBuilder.validateResponse(frame, response)
-
-        } catch (_: IOException) {
-            return null
+        } catch (_: SocketTimeoutException) {
+            return DumlExchangeResult(
+                terminalReason = "timeout",
+                observations = observations
+            )
+        } catch (e: IOException) {
+            return DumlExchangeResult(
+                terminalReason = "io_error:${e.javaClass.simpleName}",
+                observations = observations
+            )
         } finally {
             try { socket?.close() } catch (_: IOException) {}
         }
@@ -536,12 +597,24 @@ class DumlTransport {
         return allSuccess
     }
 
+    private fun readDumlFrame(input: java.io.InputStream): ByteArray? {
+        val header = readBytes(input, 11) ?: return null
+        if (header[0] != 0x55.toByte()) return null
+
+        val totalLength = (header[1].toInt() and 0xFF) or ((header[2].toInt() and 0x03) shl 8)
+        if (totalLength !in 13..1023) return null
+
+        val remaining = readBytes(input, totalLength - 11) ?: return null
+        return header + remaining
+    }
+
+    @Throws(IOException::class)
     private fun readBytes(input: java.io.InputStream, count: Int): ByteArray? {
         val out = ByteArray(count)
         var read = 0
         while (read < count) {
-            val n = try { input.read(out, read, count - read) } catch (_: IOException) { return null }
-            if (n <= 0) return if (read > 0) out.copyOf(read) else null
+            val n = input.read(out, read, count - read)
+            if (n <= 0) return null
             read += n
         }
         return out
@@ -560,6 +633,7 @@ class DumlTransport {
 
         /** TCP connect timeout for all socket opens to the DUML proxy. */
         private const val CONNECT_TIMEOUT_MS = 2000
+        private const val MAX_RESPONSE_OBSERVATIONS = 8
     }
 
     /** Reused read buffer for ACK reads — avoids a per-frame allocation. */

@@ -13,9 +13,9 @@ android {
     defaultConfig {
         applicationId = "com.freefcc.app"
         minSdk = 29
-        targetSdk = 35
-        versionCode = 20
-        versionName = "1.5.2"
+        targetSdk = 29
+        versionCode = 35
+        versionName = "1.5.3-research.16"
     }
 
     val keystorePropsFile = rootProject.file("keystore.properties")
@@ -64,6 +64,11 @@ android {
                 signingConfig = null
             }
         }
+        create("research") {
+            initWith(getByName("release"))
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+        }
     }
 
     compileOptions {
@@ -78,6 +83,11 @@ android {
     buildFeatures {
         compose = true
     }
+
+    lint {
+        // Sideloaded RC2 research build: API 29 preserves legacy access to DJI Fly's shared log.
+        disable += "ExpiredTargetSdkVersion"
+    }
 }
 
 dependencies {
@@ -90,6 +100,8 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.documentfile:documentfile:1.0.1")
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

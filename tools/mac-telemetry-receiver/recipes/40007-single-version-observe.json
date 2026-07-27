@@ -1,0 +1,53 @@
+{
+  "schema": "duml-lab/v1",
+  "name": "40007 single version inquiry then observe",
+  "port": 40007,
+  "connect_timeout_ms": 2000,
+  "total_timeout_ms": 7000,
+  "max_rx_bytes": 262144,
+  "setup": [
+    {
+      "op": "connect",
+      "label": "open one persistent socket"
+    },
+    {
+      "op": "write_duml",
+      "label": "single version inquiry",
+      "sender": 2,
+      "destination": 6,
+      "cmd_type": 0,
+      "cmd_set": 0,
+      "cmd_id": 1,
+      "payload_b64": "",
+      "wire": "wrapped_40007"
+    }
+  ],
+  "cycle": [
+    {
+      "op": "read",
+      "label": "capture initial burst",
+      "duration_ms": 1000,
+      "idle_timeout_ms": 100,
+      "max_bytes": 65536
+    },
+    {
+      "op": "sleep",
+      "label": "leave socket untouched",
+      "duration_ms": 3000
+    },
+    {
+      "op": "read",
+      "label": "check socket after quiet period",
+      "duration_ms": 1000,
+      "idle_timeout_ms": 1000,
+      "max_bytes": 65536
+    }
+  ],
+  "cycle_count": 1,
+  "teardown": [
+    {
+      "op": "close",
+      "label": "explicit close"
+    }
+  ]
+}

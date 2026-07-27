@@ -1,0 +1,1 @@
+dji-flightlog-parser @ git+https://github.com/olavbolav/dji-flightlog-parser.git@0a5f59d1d3dc00c8a9531c05d57146ee5f5f098b

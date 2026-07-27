@@ -34,6 +34,7 @@ A free and open-source Android app that unlocks FCC mode, sends 4G activation fr
 | **4G Activation** | Sends 4G activation frames to the aircraft (serial read at runtime) — no status readback, experimental |
 | **LED Control** | Turn aircraft arm LEDs on or off (requires DJI Fly running with aircraft connected) |
 | **Device Info** | Queries the controller for hardware and firmware version |
+| **Telemetry Research** | Bench-only raw DUML relay to a local Mac for georeferencing research |
 | **Auto-FCC** | Toggle to automatically connect and apply FCC every time the app opens |
 | **Auto-Updater** | Checks GitHub for new releases and lets you download/install from the app |
 | **Offline** | Everything runs locally. No internet, no server, no tracking (except update check) |
@@ -106,13 +107,18 @@ Back into your folder on the SD card. Install `03_ATVLauncher` but don't open it
 
 ### 5. Set up Edge Gestures
 
-Install `04_Edge Gestures` and this time tap OPEN. Follow the prompts and grant the Accessibility service permission. Then:
+Install `04_Edge Gestures` and this time tap OPEN. Follow the prompts and grant its Accessibility service permission. Then:
 
 - Disable the left gesture, keep only the right side
 - Scroll down to "Swipe to the left", tap it
 - Pick Application, then choose ATV Launcher
 
 Now swiping right-to-left on the screen opens the launcher.
+
+FreeFCC no longer depends on Edge Gestures to reach the hidden Accessibility
+panel. The Telemetry page shows whether `FreeFCC Home Point` is enabled and
+opens the same system panel directly. Starting `Lab` also opens it
+automatically when access is missing.
 
 ### 6. Install FreeFCC
 
@@ -174,6 +180,211 @@ Every contribution helps cover server costs and keeps development going. Thank y
 The app sends DUML commands to the controller's local TCP proxy at `127.0.0.1:40009`. DUML is DJI's internal command protocol, publicly documented in the [dji-firmware-tools](https://github.com/o-gs/dji-firmware-tools) project.
 
 Each command is a small binary packet with a magic byte (`0x55`), a header with sender and receiver info, a payload, and two CRC checksums. The app builds these packets from JSON profile files and sends them over TCP, one packet per connection.
+
+### Telemetry Research Mode
+
+This fork adds a separate Telemetry tab for raw metadata research. It can stream `RAW_CHUNK` and validated `DUML_FRAME` NDJSON records to a local Mac on port `8765`.
+
+`1.5.3-research.16` adds persisted SAF access for the live DJI Fly
+`Android/data/dji.go.v5/files/FlightRecord` directory. Select that directory
+once through the RC2 DocumentsUI picker before starting the Log relay. Without
+SAF access, the source falls back to the delayed public mirror at
+`Download/product_data/flightRecords`.
+`Flight Log Tail` follows
+`/storage/emulated/0/Android/data/dji.go.v5/files/FlightRecord`, emits
+offset-addressed `FLIGHT_LOG_CHUNK` records, and opens no DJI controller
+socket. The Mac receiver reconstructs each file byte-for-byte before optional
+v14 keychain decoding.
+
+The previous default source is the read-only RC2 publish endpoint
+`127.0.0.1:8902`. One socket remains open for the explicit session, the app
+sends no bytes to that endpoint, and a `TELEMETRY_TICK` produces one Mac-side
+`GEOREFERENCE_SAMPLE` per second. A connected but silent endpoint is reported
+as `open_silent`, never as active metadata.
+
+The separate DUML parser accepts both direct DUML and the observed
+`55 cc 30 75 + u32 little-endian length + inner DUML` envelope. Inner frames
+are emitted only after encoded-length, CRC-8 and CRC-16 validation. The
+Telemetry tab can instead select direct `40009` or wrapped `40007` for one
+explicit bench connection.
+
+Port `8902` uses a bounded parser for `F5 64`, `F6 64`, and `F8 64`
+length-delimited records and their 32-bit controller clock. It is not DUML.
+Raw bytes are retained as chunk artifacts and `raw-stream.bin` for replay.
+The active `40007 1Hz` source follows the controller's observed one-command-
+per-connection contract. Every second it opens a bounded socket, sends one
+wrapped `02 -> 06`, `00/01` inquiry, captures the response burst, and closes.
+It never writes a second command on the same socket. A snapshot is fresh only
+when it contains CRC-valid DUML without parser errors; any failed round emits
+`unavailable` before the next bounded attempt.
+
+Passive sources still write no source bytes and hold one explicit connection.
+EOF or I/O failure records a capture gap and clears live metadata.
+The ongoing Android telemetry notification remains active after switching to
+DJI Fly and reports `active`, `open_silent`, gap, or unavailable.
+
+The receiver also exposes a control socket forced to Mac loopback on
+`127.0.0.1:8766`. It can request the predefined one-shot `03/43` candidate
+decoder, send one structured DUML frame, or forward a `duml-lab/v1` recipe.
+Every request is correlated by `request_id` and persisted in session NDJSON.
+
+DUML Lab recipes can select any controller-local TCP port `1..65535`, build
+direct or wrapped DUML with fresh sequence/CRCs, send exact raw bytes, and
+compose explicit `connect`, `write_duml`, `write_raw`, `read`, `sleep`, and
+`close` steps. Setup and teardown run once; a cycle can repeat on the same
+socket. Reconnecting requires another explicit `connect` step. Android enforces
+one command at a time, the hardware/port leases, a 30-second deadline, 512
+expanded steps, 64 KiB transmitted and 256 KiB received. Arbitrary recipes are
+accepted only while the operator has explicitly selected `Lab only`.
+
+Select `Lab only` in the Telemetry tab to keep the foreground relay connected
+without reserving a controller capture port. The LAN relay emits a five-second
+heartbeat that never touches DJI hardware. This makes every localhost port
+available to a Mac-authored recipe without another APK build.
+
+While `Lab only` is active, the existing DJI Fly Accessibility service also
+captures a bounded view of the active DJI Fly accessibility tree once per
+second. `DJI_FLY_UI_SNAPSHOT` records contain visible labels and descriptions,
+their original RC monotonic capture time, node count and truncation state.
+They are local research observations with `semantics=unparsed`; they are never
+promoted to position, height, heading or gimbal metadata automatically. The
+service visits at most 300 nodes and relays at most 80 labels / 1,500
+characters per snapshot. It opens no DJI socket.
+
+Physical bench status from 2026-07-22/23: the earlier relay streamed over LAN
+while DJI Fly remained connected on the tested RC2, and the final `research.3`
+session recorded 11,512 validated frames without parser errors. Two Mac-side
+`8902` connects succeeded but delivered zero bytes for 15 seconds, so
+`research.8` requires `active` byte evidence on this Neo 2/firmware before
+relying on that endpoint.
+
+Four one-shot probes from `research.3` reported `no_response`. Review of
+`dji-firmware-tools` then showed that valid DJI replies may omit the RESPONSE
+bit. `research.4` accepted such replies only when CRC, sequence, reverse routing
+and command set/ID still matched, but physical `03/43` and `00/51` tests still
+returned no matched response. `research.5` added bounded raw response
+diagnostics. The `research.6` path used read-only `40007`: observed
+families `03/43`, `03/44`, `04/05` and `51/14` are retained as candidates.
+Aircraft identity is extracted only from a CRC-valid `51/14` frame on the
+observed `0xEE -> App` route. The decoder now enforces Skylab's RM510 layout:
+one count/reserved prefix followed by exactly `N` 49-byte neighbor records.
+Identity matching is confined to each record's 23-byte identity region;
+link-state and timestamp/age words are retained as raw diagnostics.
+
+The 2026-07-23 Neo 2 bench correlation matched `03/43` latitude/longitude and
+aircraft yaw against DJI Fly/operator observations. These fields are now
+`probable` for that model and firmware scope. `03/44` exposed a `323.843 m`
+home-altitude value while surveyed terrain was about `7 m AMSL`; the receiver
+therefore records it only as pressure/fused-datum diagnostics and never as
+geodetic altitude. `03/57 GPS GLNS Info` contains the desired signed int32
+`hMSL` millimetres field, but was not present in the short capture and a
+one-shot `40009` request returned no response. Absolute altitude remains null
+until a CRC-valid `03/57` frame is captured and correlated.
+
+`research.7` also adds the RC Android system serial and its source to `HELLO`.
+This is the preferred RC identity path; read-only `00/51` requests to the
+ground-link components returned only status bytes or no response.
+
+Run the Mac companion:
+
+```sh
+cd tools/mac-telemetry-receiver
+python -m rc2_telemetry_receiver \
+  --listen 0.0.0.0:8765 \
+  --out /Users/jorgen/Documents/RC/captures
+```
+
+The receiver preserves raw bytes and clears current georeference values after
+capture gaps. A one-shot GPS hMSL research request is available as
+`--probe-gps-hmsl`; it is never retried automatically.
+
+Run or edit a bounded lab strategy without rebuilding Android:
+
+```sh
+python -m rc2_telemetry_receiver \
+  --lab recipes/40007-reconnect-snapshots.json
+```
+
+Starter recipes also cover a single direct `40009` transaction and a passive
+`8902` observation. Results contain every step, exact TX/RX bytes, validated
+DUML frames, parser errors and the terminal reason. See
+[`docs/DUML_LAB.md`](docs/DUML_LAB.md) for the recipe contract.
+
+Auto-FCC no longer writes a keepalive profile every two seconds. The FreeFCC
+Home Point Accessibility service waits on localized DJI Fly text without
+opening DUML, then sends the complete FCC profile once on a short `40009`
+lease. Manual FCC and the general one-shot DUML Lab remain available.
+
+The 2026-07-25 physical session disproved socket reuse on the tested Neo 2.
+One `00/01` inquiry produced a valid response burst, but the controller closed
+the idle socket after roughly two seconds and a rapid second write reset it.
+The one-command-per-connection Lab recipe then completed three one-hertz
+snapshots while DJI Fly was open: three connections, 63 TX bytes, 6,026 RX
+bytes, CRC-valid frames in every window, and no parser error or reset.
+`research.11` implemented that exact transport contract. A later 20-second
+soak completed 20/20 connections and decoded repeated `03/43` and `04/05`, but
+DJI Fly's own telemetry disappeared once per second. `40007 1Hz` is therefore
+rejected as a flight-safe source on this RC2/Neo 2 combination.
+
+Direct `40009` remained compatible with DJI Fly but exposed only a narrow RC
+stream without the required flight/gimbal families. Controller port `8902`
+accepted a LAN connection but stayed byte-silent in foreground, DJI Fly and
+handoff tests. `research.12` therefore introduced `Lab only` as the
+non-invasive runtime and the Accessibility UI snapshot stream for live label
+discovery. `research.13` adds direct access to the RC2's otherwise hidden
+Accessibility panel. `research.16` adds the DJI Fly flight-log tail after MTP
+confirmed the log directory and a partially written v14 log decoded 92
+complete frames while safely rejecting its truncated final record.
+
+The Mac receiver now emits one field-freshness-controlled
+`GEOREFERENCE_SAMPLE` per second. AMSL from candidate `03/57` and takeoff
+relative height from probable `03/43` remain separate, and a newer `03/43`
+cannot erase a fresh AMSL value. Samples carry stable source/session identity,
+field-level DUML provenance, RC capture time, Mac receive time and measured
+relay age. Relay age prefers the Android monotonic clock anchor from `HELLO`,
+so reconnect backlog cannot appear fresh because of RC wall-clock skew.
+
+Optional MQTT output is implemented only on the Mac. It publishes the exact
+stored envelope to `nordlys/rc2/{source_id}/georeference`, never publishes raw
+DUML, and drops disconnected, unclocked or stale samples instead of buffering
+them. MQTT is disabled by default and requires the companion's optional
+`requirements-mqtt.txt`.
+
+The 2026-07-25 review of SkylabFCCfree through `v1.5.49` also examined its
+single-notification foreground refactor and FCC country read/write checks.
+Neither is imported here: telemetry needs its own ongoing foreground service,
+and periodic `07/19`/`07/30` country traffic does not improve metadata capture.
+The structured RM510 `51/14` layout is the relevant change adopted in this
+release.
+
+Current research build: `1.5.3-research.16`. It remains bench-only until its
+physical RC2 gate has passed. See
+[`docs/TELEMETRY_ARCHITECTURE.md`](docs/TELEMETRY_ARCHITECTURE.md) for the
+transport boundary and acceptance gates.
+
+### Research Update Channel
+
+Research builds use `https://api.github.com/repos/jorron87/FreeFCC/releases/latest` by default. The Updates tab also accepts another GitHub Releases API URL or a small manifest URL for fast fork builds:
+
+```json
+{
+  "version": "1.5.3-research.1",
+  "title": "Telemetry relay bugfix",
+  "changelog": "Fix relay reconnect and parser counters.",
+  "apk_url": "https://example.test/FreeFCC-research.apk",
+  "apk_size": 12345678,
+  "sha256": "hex-encoded-sha256",
+  "published_at": "2026-07-22T20:00:00Z"
+}
+```
+
+If `sha256` is present, the app refuses to install an APK whose digest does not match.
+
+Maintainers can build, test, and publish the current version as a GitHub release with:
+
+```sh
+tools/publish-research-release.sh "Short release notes"
+```
 
 ### FCC Profile
 

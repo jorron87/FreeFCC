@@ -1,0 +1,49 @@
+{
+  "schema": "duml-lab/v1",
+  "name": "40007 one command per connection snapshots",
+  "port": 40007,
+  "connect_timeout_ms": 2000,
+  "total_timeout_ms": 10000,
+  "max_rx_bytes": 262144,
+  "setup": [],
+  "cycle": [
+    {
+      "op": "connect",
+      "label": "open snapshot socket"
+    },
+    {
+      "op": "write_duml",
+      "label": "single version inquiry",
+      "sender": 2,
+      "destination": 6,
+      "cmd_type": 0,
+      "cmd_set": 0,
+      "cmd_id": 1,
+      "payload_b64": "",
+      "wire": "wrapped_40007"
+    },
+    {
+      "op": "read",
+      "label": "capture snapshot burst",
+      "duration_ms": 1000,
+      "idle_timeout_ms": 100,
+      "max_bytes": 65536
+    },
+    {
+      "op": "close",
+      "label": "close after one command"
+    },
+    {
+      "op": "sleep",
+      "label": "one hertz pacing",
+      "duration_ms": 800
+    }
+  ],
+  "cycle_count": 3,
+  "teardown": [
+    {
+      "op": "close",
+      "label": "ensure closed"
+    }
+  ]
+}
